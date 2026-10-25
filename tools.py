@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import re
 import urllib.error
@@ -28,7 +27,7 @@ SEARCHABLE_SUFFIXES = {
 }
 SENSITIVE_ASSIGNMENT = re.compile(
     r"""(?ix)
-    (\b(?:api[_-]?key|client[_-]?secret|secret(?:[_-]?key)?|token|
+    (\b(?:api[_-]?(?:key|token)|client[_-]?secret|secret(?:[_-]?key)?|token|
         password|passwd|credential|private[_-]?key)\b\s*[:=]\s*)
     (?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;#]+)
     """
@@ -343,6 +342,33 @@ class GitHubRepository:
         normalized = self._validate_path(path)
         return normalized in self._inspected_paths
 
+    def inspected_files(self) -> dict[str, str]:
+        return {
+            path: self._read_cache[path]
+            for path in self._inspected_paths
+            if path in self._read_cache
+        }
+
+    def supports_audit_finding(
+        self,
+        rule_id: str,
+        path: str,
+        line: int,
+        evidence: str,
+    ) -> bool:
+        normalized = self._validate_path(path)
+        if normalized not in self._inspected_paths:
+            return False
+        from audit import supports_finding
+
+        return supports_finding(
+            rule_id,
+            normalized,
+            line,
+            evidence,
+            {normalized: self._read_cache[normalized]},
+        )
+
 
 def build_tool_schemas() -> list[dict[str, Any]]:
     return [
@@ -388,6 +414,18 @@ def build_tool_schemas() -> list[dict[str, Any]]:
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "audit_inspected_files",
+                "description": (
+                    "Run conservative security and CI checks on files already read. "
+                    "Use after inspecting relevant configuration/source files; results "
+                    "are partial evidence, not a complete repository audit."
+                ),
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
     ]
 
 
@@ -397,13 +435,44 @@ class RepositoryTools:
 
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "list_files":
+            self._validate_arguments(name, arguments, set())
             return self.repository.list_files()
         if name == "read_file":
+            self._validate_arguments(name, arguments, {"path"})
             path = arguments.get("path")
+            if not isinstance(path, str):
+                raise RepositoryError("Tool argument 'path' must be a string.")
             return self.repository.read_file(path)
         if name == "search_code":
+            self._validate_arguments(name, arguments, {"pattern"})
             pattern = arguments.get("pattern")
+            if not isinstance(pattern, str):
+                raise RepositoryError("Tool argument 'pattern' must be a string.")
             return self.repository.search_code(pattern)
         if name == "git_log":
+            self._validate_arguments(name, arguments, set())
             return self.repository.git_log()
+        if name == "audit_inspected_files":
+            self._validate_arguments(name, arguments, set())
+            from audit import audit_inspected_files
+
+            return audit_inspected_files(self.repository.inspected_files())
         raise RepositoryError(f"Unsupported inspection tool: {name}")
+
+    @staticmethod
+    def _validate_arguments(
+        name: str,
+        arguments: dict[str, Any],
+        required: set[str],
+    ) -> None:
+        missing = required - arguments.keys()
+        unexpected = arguments.keys() - required
+        if missing:
+            raise RepositoryError(
+                f"Tool '{name}' is missing required arguments: {', '.join(sorted(missing))}."
+            )
+        if unexpected:
+            raise RepositoryError(
+                f"Tool '{name}' received unsupported arguments: "
+                f"{', '.join(sorted(unexpected))}."
+            )
