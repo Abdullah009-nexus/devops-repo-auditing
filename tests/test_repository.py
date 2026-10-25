@@ -1,4 +1,5 @@
 import dataclasses
+import glob
 import hashlib
 import io
 import os
@@ -439,6 +440,12 @@ class OpenSourceTests(unittest.TestCase):
             open_source(ADDRESS, self.settings)
 
     def test_falls_back_even_when_cleanup_of_the_failed_clone_fails(self):
+        # The simulated cleanup failure leaves the workspace behind; remove what this test made.
+        pattern = os.path.join(tempfile.gettempdir(), self.settings.repository.temp_dir_prefix + "*")
+        existing = set(glob.glob(pattern))
+        self.addCleanup(
+            lambda: [shutil.rmtree(d, ignore_errors=True) for d in set(glob.glob(pattern)) - existing]
+        )
         tree = {"truncated": False, "tree": []}
         with (
             patch("auditor.repository._request_json", side_effect=[METADATA, tree]),

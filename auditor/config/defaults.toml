@@ -95,10 +95,14 @@ finalize_wall_seconds = 120
 finalize_turns = 2                  # report-only turns granted once a budget is spent
 max_finding_field_chars = 2000      # longest description/evidence/recommendation accepted
 max_text_replies = 2                # consecutive replies without a tool call before the run stops
+ledger_max_paths = 60               # most recent read paths listed in the per-turn progress ledger
+ledger_max_searches = 15            # most recent search patterns listed in the ledger
+max_repeat_replies = 3              # identical calls answered without running them, per run
 
 [context]
-keep_recent_tool_results = 6        # newest tool results always sent in full
+keep_recent_tool_results = 12       # newest tool results always sent in full
 max_total_chars = 200000            # message content budget before older results are stubbed
+max_stub_args_chars = 200           # longest argument text kept in a stub, so the model sees what was dropped
 
 [trace]
 enabled = true
