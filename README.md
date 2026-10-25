@@ -75,9 +75,9 @@ Any OpenAI-compatible endpoint with tool calling works; the model choice doesn't
 |---|---|---|
 | **Google Gemini** (recommended free option) | `https://generativelanguage.googleapis.com/v1beta/openai/` | Free key from Google AI Studio; use a current **Flash** model; large context window |
 | **Groq** (backup) | `https://api.groq.com/openai/v1` | Free tier, fast, smaller tokens-per-minute limits |
-| **OpenAI** (paid) | `https://api.openai.com/v1` (default) | Any current tool-capable model |
+| **OpenAI** (paid) | `https://api.openai.com/v1` (default) | A tool-capable model that accepts sampling parameters, e.g. `gpt-4.1-mini` |
 
-Free tiers change their models and limits often; check the provider console. Rate-limit (429) and server (5xx) errors are retried automatically with backoff.
+Some newer models reject the `temperature` setting; the agent detects that, retries once without it and remembers. Free tiers change their models and limits often; check the provider console. Rate-limit (429) and server (5xx) errors are retried automatically with backoff.
 
 Optional: set `GITHUB_TOKEN` (any read-only token) to raise the GitHub API rate limit. It's only sent to `api.github.com` and to the clone, never in URLs or command lines.
 
@@ -126,8 +126,11 @@ python agent.py --repo <github_repository_url> --output <report.json> [--config 
 | `0` | Inspection completed and the report was written (also when there are no violations) |
 | `1` | Runtime failure: repository unreachable, LLM provider failing after retries, output not writable. No report is written |
 | `2` | Bad input or configuration: invalid URL, missing `OPENAI_API_KEY`/`OPENAI_MODEL`, invalid `--config`/`AUDITOR_*` value, malformed `.env` |
+| `130` | Stopped with Ctrl+C. Nothing is written and the temporary clone is deleted |
 
 Every fatal error prints a one-line `Error: …` message on stderr.
+
+A run takes roughly 30–90 seconds: each model turn can take several seconds, and rate-limit retries add waits. Use `--verbose` to see "asking the model …", the reply time and any retry, so a slow turn doesn't look like a hang.
 
 ---
 
@@ -161,7 +164,8 @@ agent.py              CLI: arguments, settings, early checks, exit codes
 │   ├── findings.py        FindingStore: catalog, severity, grounding, guards, dedup
 │   └── trace.py           redacted JSONL trace
 │
-├── tools.py               the tool surface the model sees, JSON schemas, strict argument checks
+├── tools.py               the inspection tools the model sees, their JSON schemas, strict argument checks
+│                           (the report_finding / finish_audit schemas are in auditor/findings.py)
 │   ├── auditor/repository.py   read-only sources: hardened clone, GitHub API fallback, local dir
 │   ├── auditor/redaction.py    one secret matcher for every output
 │   └── auditor/checks.py       11 data-driven detectors (audit_inspected_files)
@@ -262,7 +266,7 @@ The rule catalog, detector patterns, false-positive guards and redaction rules l
 ## Testing and evaluation
 
 ```bash
-python -m unittest discover -s tests -v     # ~500 unit/integration tests; no network, no API key needed
+python -m unittest discover -s tests -v     # 500+ unit/integration tests; no network, no API key needed
 python -m eval.run                          # offline detector baseline over the labelled eval cases
 python -m eval.run --live                   # the real agent on every eval case (uses your LLM quota)
 ```
@@ -274,6 +278,12 @@ python -m eval.run --live                   # the real agent on every eval case 
   - **C (healthy repositories with traps), 6 cases.**
 
   It reports precision, recall and F1 per case. The offline mode measures the deterministic detector layer alone: currently 13 of 15 labelled violations found with **0 false positives**. The 2 misses are absence findings (no tests, no CI) that only the model makes. These synthetic numbers are not a measure of accuracy on unseen repositories.
+
+---
+
+## Example output
+
+[`sample_report.json`](sample_report.json) is the unedited result of running the agent on `https://github.com/gotcha/ipdb` with a tool-calling model: 6 model turns, 15 tool calls, 2 low-severity findings (an incomplete `.gitignore` and bare `except:` clauses). A repeatable local check on labelled repositories is `python -m eval.run --live`; in one live run on 8 of the 18 evaluation cases the agent found every labelled defect with no false positives on the four healthy repositories. That is a small synthetic sample, not a measure of accuracy on unseen repositories.
 
 ---
 
@@ -322,4 +332,4 @@ pyproject.toml              project metadata (no dependencies); requirements.txt
 | Target unchanged, no code execution, no secret exposure | `auditor/repository.py`, `auditor/redaction.py`, safety tests |
 | Graceful handling of missing files, API errors, invalid input, timeouts | `auditor/repository.py`, `auditor/llm_client.py`, `tools.py` |
 | `requirements.txt` / `pyproject.toml`, `.env.example`, `tests/` | repository root |
-| Authentic `sample_report.json` | produced by a real run (see repository root) |
+| Authentic `sample_report.json` | `sample_report.json`: unedited output of a real run on `github.com/gotcha/ipdb` |
