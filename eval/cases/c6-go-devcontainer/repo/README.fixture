@@ -1,0 +1,3 @@
+# builder
+
+Go build helper. Open in the dev container, then run go test.

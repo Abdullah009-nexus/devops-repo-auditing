@@ -117,12 +117,15 @@ class CliTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
         self.assertFalse(self.workspaces[0].exists())
 
-    def test_clone_is_removed_when_an_unexpected_error_escapes_main(self):
+    def test_clone_is_removed_and_the_error_reported_when_something_unforeseen_fails(self):
         def crash(repository):
             raise RuntimeError("unexpected")
 
-        with self._run_agent_that(crash), self.assertRaisesRegex(RuntimeError, "unexpected"):
-            agent.main(self.ARGV)
+        with self._run_agent_that(crash):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 1)
+        self.assertIn("Error: unexpected RuntimeError: unexpected", self.stderr.getvalue())
+        self.assertFalse(self.output.exists())
         self.assertFalse(self.workspaces[0].exists())
 
     def test_report_that_breaks_the_contract_is_not_written(self):
@@ -284,3 +287,34 @@ class ReportWriterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnexpectedFailureTests(unittest.TestCase):
+    def test_an_unforeseen_exception_becomes_one_error_line_with_exit_1(self):
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, contextlib.chdir(directory):
+            with (
+                patch.object(agent, "run_agent", side_effect=ZeroDivisionError("boom")),
+                patch.object(agent, "GitHubRepository"),
+                patch.object(agent, "LLMClient"),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = agent.main(
+                    ["--repo", "https://github.com/o/r", "--output", str(Path(directory) / "r.json")]
+                )
+        self.assertEqual(code, 1)
+        self.assertIn("Error: unexpected ZeroDivisionError: boom", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+
+class InterruptTests(unittest.TestCase):
+    def test_ctrl_c_exits_cleanly_without_a_traceback(self):
+        stderr = io.StringIO()
+        with (
+            patch.object(agent, "_audit", side_effect=KeyboardInterrupt),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = agent.main(["--repo", "https://github.com/o/r", "--output", "report.json"])
+        self.assertEqual(code, 130)
+        self.assertIn("Interrupted", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())

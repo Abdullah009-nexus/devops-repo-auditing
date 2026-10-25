@@ -1,0 +1,25 @@
+{
+  "repository": "https://github.com/gotcha/ipdb",
+  "violations": [
+    {
+      "rule_id": "HYG-003",
+      "category": "repository_hygiene",
+      "severity": "low",
+      "file": ".gitignore",
+      "line": 19,
+      "description": "The .gitignore doesn't cover several common Python artefacts. CI runs `coverage run`, which writes a `.coverage` file, and that file isn't ignored. Other missing entries are `.eggs/`, virtualenv directories such as `.venv`/`venv`, `.pytest_cache`, and `.idea`/`.vscode`. The existing `bin`, `lib` and `include` entries are unanchored and appear to stand in for a virtualenv layout.",
+      "evidence": "19: pip-selfcheck.json",
+      "recommendation": "Add `.coverage`, `coverage.xml`, `htmlcov/`, `.eggs/`, `.venv/`, `venv/`, `.pytest_cache/` and editor directories to .gitignore."
+    },
+    {
+      "rule_id": "QUA-002",
+      "category": "code_quality",
+      "severity": "low",
+      "file": "ipdb/__main__.py",
+      "line": 343,
+      "description": "Library code uses bare `except:` clauses (line 343 here, and line 22 around the configparser import). A bare except also catches KeyboardInterrupt and hides real errors. `_init_pdb` additionally uses a mutable default argument, `commands=[]`.",
+      "evidence": "343:         except:\n344:             traceback.print_exc()",
+      "recommendation": "Catch specific exceptions (`ImportError` for the import fallback, `Exception` in main). Replace mutable defaults with `None`."
+    }
+  ]
+}

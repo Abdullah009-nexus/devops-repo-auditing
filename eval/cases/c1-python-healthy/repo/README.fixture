@@ -1,0 +1,3 @@
+# Token reader
+
+Set `API_TOKEN` in the environment. See `.env.example`.

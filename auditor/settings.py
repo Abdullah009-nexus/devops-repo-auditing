@@ -132,12 +132,16 @@ class AgentSettings:
     finalize_turns: int = _bounded(1)
     max_finding_field_chars: int = _bounded(1)
     max_text_replies: int = _bounded(1)
+    ledger_max_paths: int = _bounded(1)
+    ledger_max_searches: int = _bounded(1)
+    max_repeat_replies: int = _bounded(0)
 
 
 @dataclass(frozen=True)
 class ContextSettings:
     keep_recent_tool_results: int = _bounded(1)
     max_total_chars: int = _bounded(1)
+    max_stub_args_chars: int = _bounded(1)
 
 
 @dataclass(frozen=True)

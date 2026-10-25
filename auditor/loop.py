@@ -21,6 +21,7 @@ from auditor.findings import (
 )
 from auditor.llm_client import LLMClient, LLMError
 from auditor.prompts import load_prompt
+from auditor.redaction import redact_secrets
 from auditor.report import build_report
 from auditor.rules import render_catalog_for_prompt
 from auditor.settings import Settings
@@ -32,6 +33,14 @@ LOGGER = logging.getLogger(__name__)
 
 _FENCE = "```"
 _TRUNCATION_NOTICE = "The complete tool result exceeded the output limit."
+_STUB_PREFIX = '{"compacted": true'
+LEDGER_MARKER = "PROGRESS LEDGER"
+_LEDGER_RULES = (
+    "Don't repeat a call you have already made. Record each finding with report_finding as "
+    "soon as you have confirmed evidence for it, instead of saving them for the end. When the "
+    "checklist in your instructions is covered, call finish_audit."
+)
+
 
 
 class AgentError(Exception):
@@ -63,6 +72,12 @@ class AuditAgent:
         self._rejected = 0
         self._text_replies = 0
         self._started = 0.0
+        # Insertion-ordered sets: what the model has looked at, for the per-turn ledger.
+        self._read_paths: dict[str, None] = {}
+        self._searches: dict[str, None] = {}
+        # (tool, canonical arguments) -> (turn, tool_call_id) of the run that produced a result.
+        self._executed: dict[tuple[str, str], tuple[int, str]] = {}
+        self._repeat_replies = 0
 
     def run(self) -> dict[str, Any]:
         """Investigate until the model finishes or a budget ends, and return the report."""
@@ -148,10 +163,15 @@ class AuditAgent:
         """Run one model turn; True when the model is done."""
         self._turn += 1
         self._messages = compact(self._messages, self._settings.context)
+        # A model call can take many seconds; without this line a verbose run looks frozen.
+        LOGGER.info("turn %d: asking the model (%d messages) ...", self._turn, len(self._messages))
+        asked = self._clock()
         try:
-            message = self._client.chat(self._messages, offered)
+            # The ledger is appended to the request only, so it never piles up in the history.
+            message = self._client.chat(self._messages + [self._ledger()], offered)
         except LLMError as exc:
             raise AgentError(str(exc)) from exc
+        LOGGER.info("turn %d: model replied in %.1f s", self._turn, self._clock() - asked)
         calls = _well_formed_calls(message)
         self._tracer.event(
             "llm_response",
@@ -170,14 +190,18 @@ class AuditAgent:
         for call in calls:
             name = call["function"]["name"]
             LOGGER.info("turn %d: %s", self._turn, name)
-            content = self._dispatch(name, call["function"]["arguments"], allow_inspection)
+            content = self._dispatch(
+                name, call["function"]["arguments"], allow_inspection, call["id"]
+            )
             self._messages.append(
                 {"role": "tool", "tool_call_id": call["id"], "content": content}
             )
             finished = finished or name == FINISH_AUDIT
         return finished
 
-    def _dispatch(self, name: str, raw_arguments: str, allow_inspection: bool) -> str:
+    def _dispatch(
+        self, name: str, raw_arguments: str, allow_inspection: bool, call_id: str = ""
+    ) -> str:
         if name == FINISH_AUDIT:
             return json.dumps({"finished": True, "accepted": len(self._store.findings)})
         arguments, problem = _parse_arguments(raw_arguments)
@@ -195,12 +219,76 @@ class AuditAgent:
             )
         if self._tool_calls >= self._limits.max_tool_calls:
             return self._tool_failure(name, arguments, "The tool call budget is used up.")
+        repeated = self._repeat_reply(name, arguments)
+        if repeated is not None:
+            return repeated
         self._tool_calls += 1
+        self._executed[(name, _canonical(arguments))] = (self._turn, call_id)
+        self._note_inspection(name, arguments)
         try:
             outcome: dict[str, Any] = self._tools.call(name, arguments)
         except (RepositoryError, OSError) as exc:
             return self._tool_failure(name, arguments, str(exc))
         return self._bounded_result(name, arguments, outcome)
+
+    def _repeat_reply(self, name: str, arguments: dict[str, Any]) -> str | None:
+        """A short reply for an identical call whose full result is still in the context."""
+        earlier = self._executed.get((name, _canonical(arguments)))
+        if earlier is None or self._repeat_replies >= self._limits.max_repeat_replies:
+            return None
+        turn, call_id = earlier
+        # A compacted result is gone from the model's view, so the call has to run again.
+        if not self._is_in_full(call_id):
+            return None
+        self._repeat_replies += 1
+        content = json.dumps(
+            {
+                "repeat": True,
+                "note": f"Same call as turn {turn}; the result is unchanged and still above.",
+            }
+        )
+        self._tracer.event(
+            "tool_call",
+            self._turn,
+            name=name,
+            arguments=arguments,
+            result_chars=len(content),
+            truncated=False,
+            error="repeat_skipped",
+        )
+        return content
+
+    def _is_in_full(self, call_id: str) -> bool:
+        for message in self._messages:
+            if message.get("role") == "tool" and message.get("tool_call_id") == call_id:
+                return not (message.get("content") or "").startswith(_STUB_PREFIX)
+        return False
+
+    def _note_inspection(self, name: str, arguments: dict[str, Any]) -> None:
+        path = arguments.get("path")
+        pattern = arguments.get("pattern")
+        if name == "read_file" and isinstance(path, str):
+            self._read_paths[path] = None
+        elif name == "search_code" and isinstance(pattern, str):
+            self._searches[pattern] = None
+
+    def _ledger(self) -> dict[str, str]:
+        paths = list(self._read_paths)[-self._limits.ledger_max_paths:]
+        searches = list(self._searches)[-self._limits.ledger_max_searches:]
+        found = [
+            f"{item.rule_id} {item.file}:{item.line}" if item.file is not None else f"{item.rule_id} (no file)"
+            for item in self._store.findings
+        ]
+        lines = [
+            f"{LEDGER_MARKER}: turn {self._turn} of {self._limits.max_turns}; "
+            f"tool calls used {self._tool_calls} of {self._limits.max_tool_calls}.",
+            f"Files read so far ({len(self._read_paths)}): {', '.join(paths) or 'none'}",
+            f"Searches already run ({len(self._searches)}): {'; '.join(searches) or 'none'}",
+            f"Findings accepted so far ({len(found)}): {', '.join(found) or 'none'}",
+            _LEDGER_RULES,
+        ]
+        # Paths and patterns come from the model and may quote a secret it searched for.
+        return {"role": "user", "content": redact_secrets("\n".join(lines))}
 
     def _record_finding(self, candidate: Any, problem: str | None = None) -> dict[str, Any]:
         """Offer a finding to the store; a rejection is returned to the model, not raised."""
@@ -340,6 +428,10 @@ def _truncated(serialized: str, limit: int) -> str:
         length = max(length - (len(wrapped) - limit), 0)
         wrapped = wrap(length)
     return wrapped
+
+
+def _canonical(arguments: dict[str, Any]) -> str:
+    return json.dumps(arguments, sort_keys=True, ensure_ascii=True)
 
 
 def _text_or_none(content: Any) -> str | None:

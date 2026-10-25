@@ -1,0 +1,3 @@
+# orders
+
+Small order totals service. Run docker compose up -d for a local MySQL, then python -m pytest.
