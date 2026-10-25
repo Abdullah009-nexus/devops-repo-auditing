@@ -1,0 +1,3 @@
+# storefront
+
+Vite + React storefront. The committed development and production env files hold public build-time values only. Copy .env.example to .env.local for overrides.

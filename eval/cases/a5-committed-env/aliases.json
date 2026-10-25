@@ -1,1 +1,4 @@
-{"dot-env": ".env"}
+{
+  "dot-env": ".env",
+  "README.fixture": "README.md"
+}

@@ -13,9 +13,10 @@ venv/
 htmlcov/
 
 # Local secrets; the template stays tracked
-.env
 !.env.example
 
 # Run output (sample_report.json is committed on purpose)
 logs/
 report*.json
+config.bat
+node_modules
