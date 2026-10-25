@@ -15,7 +15,7 @@ from typing import Any, Sequence
 
 from auditor.llm_client import LLMClient, LLMError
 from auditor.loop import AgentError, AuditAgent
-from auditor.redaction import packaged_secret_rules
+from auditor.redaction import packaged_secret_rules, redact_secrets
 from auditor.report import ReportError, validate_report_shape, write_report
 from auditor.settings import ConfigError, Settings, load_env_file, load_settings
 from auditor.trace import Tracer, trace_path
@@ -99,6 +99,10 @@ def _audit(args: argparse.Namespace) -> int:
         write_report(args.output, report)
     except (AgentError, RepositoryError, ReportError, OSError) as exc:
         return _fail(exc, 1)
+    except Exception as exc:
+        # Anything unforeseen still ends as one useful line instead of a traceback; the
+        # message is redacted because exception text can echo request or file content.
+        return _fail(RuntimeError(f"unexpected {type(exc).__name__}: {redact_secrets(str(exc))}"), 1)
     print(f"Audit report written to {args.output}")
     return 0
 
@@ -108,6 +112,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     handler = _log_progress() if args.verbose else None
     try:
         return _audit(args)
+    except KeyboardInterrupt:
+        # Leaving the `with` block in _audit has already deleted the temporary clone.
+        print("Interrupted. No report was written.", file=sys.stderr)
+        return 130
     finally:
         if handler is not None:
             logging.getLogger("auditor").removeHandler(handler)

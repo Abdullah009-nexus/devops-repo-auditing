@@ -1,4 +1,4 @@
-"""Phase 1 gate: token containment, metadata/workflow redaction, dispatcher validation."""
+"""Token containment, metadata and workflow redaction, and dispatcher validation for every tool."""
 
 import json
 import os

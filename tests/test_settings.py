@@ -41,6 +41,14 @@ class PrecedenceTests(_TempDirTestCase):
         self.assertEqual(settings.repository.max_file_bytes, 256 * 1024)
         self.assertEqual(settings.git_log.default_commits, 10)
 
+    def test_efficiency_defaults(self):
+        settings = load_settings()
+        self.assertEqual(settings.context.keep_recent_tool_results, 12)
+        self.assertEqual(settings.context.max_stub_args_chars, 200)
+        self.assertEqual(settings.agent.ledger_max_paths, 60)
+        self.assertEqual(settings.agent.ledger_max_searches, 15)
+        self.assertEqual(settings.agent.max_repeat_replies, 3)
+
     def test_searchable_suffixes_have_no_duplicates(self):
         suffixes = load_settings().search.searchable_suffixes
         self.assertEqual(len(suffixes), len(set(suffixes)))
@@ -114,6 +122,9 @@ class ValidationTests(_TempDirTestCase):
     def test_out_of_range_values_are_rejected(self):
         cases = {
             "[agent]\nmax_turns = 0\n": r"agent\.max_turns must be at least 1",
+            "[agent]\nledger_max_paths = 0\n": r"agent\.ledger_max_paths must be at least 1",
+            "[agent]\nmax_repeat_replies = -1\n": r"agent\.max_repeat_replies must be at least 0",
+            "[context]\nmax_stub_args_chars = 0\n": r"context\.max_stub_args_chars must be at least 1",
             "[git_log]\nsha_length = 41\n": r"git_log\.sha_length must be at most 40",
             '[search]\nsearchable_suffixes = [".yml", ".yml"]\n': r"duplicate",
             '[github]\napi_root = "http://api.github.com"\n': r"github\.api_root must be an HTTPS URL",

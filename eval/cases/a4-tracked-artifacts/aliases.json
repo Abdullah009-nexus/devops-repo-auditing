@@ -1,1 +1,4 @@
-{"pycache-entry.txt": "__pycache__/app.cpython-311.pyc"}
+{
+  "pycache-entry.txt": "__pycache__/app.cpython-311.pyc",
+  "README.fixture": "README.md"
+}

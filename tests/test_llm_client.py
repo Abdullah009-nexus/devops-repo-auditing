@@ -178,3 +178,56 @@ class LlmSettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TemperatureRefusalTests(unittest.TestCase):
+    """Some models reject `temperature`; the client then drops it and carries on."""
+
+    def setUp(self):
+        self.client = LLMClient(default_settings().llm, ENVIRON, sleep=lambda _: None)
+
+    @staticmethod
+    def refusal(text):
+        return urllib.error.HTTPError(
+            "https://api.example.com/v1/chat/completions", 400, "bad request", {}, io.BytesIO(text)
+        )
+
+    def send(self, side_effect):
+        with patch("auditor.llm_client._opener.open", side_effect=side_effect) as opener:
+            message = self.client.chat([{"role": "user", "content": "hi"}], [])
+        return message, opener
+
+    @staticmethod
+    def body_of(call):
+        return json.loads(call.args[0].data)
+
+    def test_retries_once_without_temperature_and_remembers(self):
+        message, opener = self.send([self.refusal(b'{"error": {"message": "`temperature` is deprecated"}}'), response()])
+        self.assertEqual(message["content"], "ok")
+        self.assertIn("temperature", self.body_of(opener.call_args_list[0]))
+        self.assertNotIn("temperature", self.body_of(opener.call_args_list[1]))
+        _, later = self.send([response()])
+        self.assertNotIn("temperature", self.body_of(later.call_args_list[0]))
+
+    def test_other_bad_requests_still_fail_fast(self):
+        with self.assertRaises(LLMError) as caught:
+            self.send([self.refusal(b'{"error": {"message": "unknown model"}}')])
+        self.assertIn("HTTP 400", str(caught.exception))
+        self.assertNotIn("unknown model", str(caught.exception))
+
+    def test_a_second_refusal_is_not_retried_again(self):
+        with self.assertRaises(LLMError):
+            self.send([self.refusal(b"temperature"), self.refusal(b"temperature")])
+
+
+class RetryVisibilityTests(unittest.TestCase):
+    """A retry must be visible in verbose mode, or a rate-limited run looks frozen."""
+
+    def test_retry_is_logged_with_attempt_and_delay(self):
+        client = LLMClient(default_settings().llm, ENVIRON, sleep=lambda _: None, random_fraction=lambda: 0.5)
+        with patch("auditor.llm_client._opener.open", side_effect=[http_error(429), response()]):
+            with self.assertLogs("auditor.llm_client", level="INFO") as logs:
+                client.chat([{"role": "user", "content": "hi"}], [])
+        text = "\n".join(logs.output)
+        self.assertIn("HTTP 429", text)
+        self.assertIn("Retry 1 of", text)

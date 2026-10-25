@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import math
 import os
 import random
@@ -17,6 +18,8 @@ import urllib.request
 from typing import Any, Callable, Mapping
 
 from auditor.settings import ConfigError, LlmSettings, check_https_url
+
+LOGGER = logging.getLogger(__name__)
 
 
 class LLMError(Exception):
@@ -68,6 +71,8 @@ class LLMClient:
         self.base_url = base_url.rstrip("/")
         # The provider's token counts for the latest response, when it sent any.
         self.last_usage: dict[str, Any] | None = None
+        # Newer models refuse sampling parameters; the first refusal turns this off for good.
+        self._send_temperature = True
 
     def chat(
         self,
@@ -76,27 +81,33 @@ class LLMClient:
         tool_choice: str = "auto",
     ) -> dict[str, Any]:
         """Send one completion request and return the assistant message."""
-        request = self._build_request(messages, tools, tool_choice)
         attempt = 0
         while True:
+            request = self._build_request(messages, tools, tool_choice)
             try:
                 message, usage = self._parse(self._send(request))
                 self.last_usage = usage
                 return message
+            except _TemperatureRefused:
+                LOGGER.info("The model does not accept `temperature`; resending without it.")
+                self._send_temperature = False
             except _Transient as exc:
                 if attempt >= self._settings.max_retries:
                     raise LLMError(exc.final_message) from exc
-                self._sleep(self._delay(attempt, exc.retry_after))
+                delay = self._delay(attempt, exc.retry_after)
+                LOGGER.info(
+                    "%s Retry %d of %d in %.0f s.",
+                    exc.final_message, attempt + 1, self._settings.max_retries, delay,
+                )
+                self._sleep(delay)
                 attempt += 1
 
     def _build_request(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: str
     ) -> urllib.request.Request:
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self._settings.temperature,
-        }
+        body = {"model": self.model, "messages": messages}
+        if self._send_temperature:
+            body["temperature"] = self._settings.temperature
         if tools:
             body["tools"] = tools
             body["tool_choice"] = tool_choice
@@ -125,6 +136,8 @@ class LLMClient:
                     f"LLM provider request failed with HTTP {exc.code}.",
                     _retry_after(exc.headers),
                 ) from exc
+            if exc.code == 400 and self._send_temperature and _names_temperature(exc, limit):
+                raise _TemperatureRefused from exc
             raise LLMError(f"LLM provider request failed with HTTP {exc.code}.") from exc
         except TimeoutError as exc:
             raise _Transient("LLM provider request timed out.") from exc
@@ -162,6 +175,18 @@ class LLMClient:
         # Full jitter keeps parallel runs from retrying in lockstep.
         ceiling = min(cap, self._settings.backoff_base_seconds * 2**attempt)
         return self._random() * ceiling
+
+
+class _TemperatureRefused(Exception):
+    """The provider rejected the request because it does not accept `temperature`."""
+
+
+def _names_temperature(error: urllib.error.HTTPError, limit: int) -> bool:
+    """Whether a 400 body mentions `temperature`; the body itself is never kept or shown."""
+    try:
+        return "temperature" in error.read(limit).decode("utf-8", errors="replace").lower()
+    except OSError:
+        return False
 
 
 class _Transient(Exception):
