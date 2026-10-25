@@ -1,0 +1,2 @@
+SERVICE_URL=https://service.internal.example
+SERVICE_SECRET=local-demo-secret-value

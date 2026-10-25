@@ -1,0 +1,11 @@
+{
+  "category": "B",
+  "violations": [
+    {
+      "rule_id": "CI-007",
+      "category": "security",
+      "file": ".github/workflows/greet.yml",
+      "line": 12
+    }
+  ]
+}

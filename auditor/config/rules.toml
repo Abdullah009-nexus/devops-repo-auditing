@@ -1,0 +1,786 @@
+# Secret matching shared by redaction and the hard-coded credential check.
+# Regexes are TOML literal strings so backslashes are written as Python sees them.
+# Every pattern runs on one line at a time (private keys excepted), and each one
+# must stay linear in the line length: repository files are untrusted input, so
+# token patterns start with a look-behind that excludes their own body characters,
+# and anything open-ended is bounded.
+
+[secrets]
+# A key such as OPENAI_API_KEY or dbPassword is split into lowercase name
+# components on "_", "-", "." and camelCase boundaries. It is sensitive when its
+# trailing components equal one of these phrases, so DB_PASSWORD matches
+# "password" but password_min_length and max_tokens do not.
+key_suffixes = [
+    "password", "passwd", "pwd", "pass", "pgpassword",
+    "secret", "secret_key", "client_secret", "secret_key_base",
+    "token", "auth_token", "access_token",
+    "api_key", "apikey", "api_token",
+    "access_key", "private_key",
+    "credential", "credentials",
+]
+# Sensitive only as the whole key (Docker's auths JSON), never as a suffix, so
+# oauth and use_auth stay readable.
+exact_keys = ["auth"]
+
+# Each pattern ends where the value starts and captures the key name in group
+# "key"; the value is then read with value_pattern only if the key is sensitive.
+key_patterns = [
+    # KEY=v, key: v, "key": "v", export KEY=v. Comparisons and other operators
+    # (==, !=, <=, >=, =>, =~, :=, ::) are not assignments.
+    '''(?x)
+        (?<![\w.-])
+        (?P<quote>["']?)
+        (?P<key>[A-Za-z_][\w.-]*)
+        (?P=quote)
+        [ \t]*
+        (?: =(?![=>~]) | :(?![:=]) )
+        [ \t]*
+    ''',
+    # 'password' => 'x' (PHP, Ruby, Perl hashes).
+    '''(?<![\w.-])(?P<quote>["'])(?P<key>[A-Za-z_][\w.-]*)(?P=quote)[ \t]*=>[ \t]*''',
+    # :password => 'x' (Ruby symbols).
+    '(?<![\w:]):(?P<key>[A-Za-z_]\w*)[ \t]*=>[ \t]*',
+    # config["password"] = "x"
+    '''\[[ \t]*(?P<quote>["'])(?P<key>[A-Za-z_][\w.-]*)(?P=quote)[ \t]*\][ \t]*=(?![=~])[ \t]*''',
+    # --password x, --api-key=x. Short flags such as -p are too ambiguous.
+    '(?<![\w-])--(?P<key>[A-Za-z][\w-]*)(?:[ \t]*=[ \t]*|[ \t]+)',
+    # .netrc: "machine host login user password x" or a line of its own.
+    '^[ \t]*(?:(?:machine|default|login)[ \t][^\r\n]*?[ \t])?(?P<key>password)[ \t]+(?=[^\s=:<>!])',
+]
+# <password>x</password> where the tag name is a sensitive key.
+element_pattern = '<(?P<key>[A-Za-z_][\w.:-]*)>(?P<value>[^<\r\n]+)</(?P=key)>'
+
+# A value that is only a reference (${{ secrets.DB }}, ${DB_PASSWORD}, $DB_PASSWORD),
+# optionally quoted, is not a secret. It stays visible, unredacted and unreported,
+# because the model needs it to tell a healthy workflow from a leaking one. A
+# shell default such as ${VAR:-fallback} is not a pure reference, and neither is
+# an expression holding a quoted literal (${{ secrets.DB || 'fallback' }}). A bare
+# $VAR must look like an environment variable name, because a password may well
+# start with "$".
+reference_pattern = '''(?x)
+    (?P<quote>["']?)
+    (?: \$\{\{[^}"'\r\n]{1,256}\}\} | \$\{[A-Za-z_]\w*\} | \$[A-Z_][A-Z0-9_]* )
+    (?P=quote)
+    (?=[\s,;#)\]}]|$)
+'''
+# Triple-quoted strings first, then quoted strings with backslash escapes and
+# doubled quotes. Text glued to the closing quote ('ab'cd', shell-style
+# concatenation) belongs to the same value, so nothing after a quote the grammar
+# misjudged is left visible. Then an unterminated quote (to the end of the line,
+# failing closed), then an expression with text glued on (its inner spaces would
+# otherwise end the value early), then a bare value ending at whitespace, ",",
+# ";" or "#".
+value_pattern = '''(?x)
+      (?: "{3}(?:[^"\\]|\\.|"(?!""))*"{3}
+        | '{3}(?:[^'\\]|\\.|'(?!''))*'{3}
+        | "(?:[^"\\\r\n]|\\.|"")*"
+        | '(?:[^'\\\r\n]|\\.|'')*'
+      ) [^\s,;#)\]}]*
+    | ["'][^\r\n]*
+    | [^\s,;#]*\$\{\{[^}\r\n]{0,256}\}\}[^\s,;#]*
+    | [^\s,;#]+
+'''
+
+# The credential check ignores values that are obviously not real secrets.
+# Redaction does not: hiding a placeholder is harmless, leaking a key is not.
+placeholder_values = [
+    "changeme", "change-me", "example", "dummy", "fake", "not-a-secret",
+    "placeholder", "redacted", "replace-me", "test", "todo", "your-token",
+    "your_api_key",
+    # Default logins of the database images used as CI and compose services.
+    "postgres", "password", "root", "rootpassword", "mysql",
+]
+placeholder_markers = [
+    "${", "$env:", "$(", "os.getenv", "os.environ", "environ.get",
+    "secretmanager", "vault.", "your-",
+]
+min_secret_length = 8
+# Values of sensitive-looking keys that are settings, not secrets
+# (permissions: id-token: write, secret: false). They stay visible so the model
+# can judge them; the comparison is on the unquoted, casefolded value.
+non_secret_values = ["read", "write", "none", "true", "false", "null", "~", "yes", "no"]
+
+# Secrets whose name and value sit on different lines. Kubernetes, ECS and Actions
+# env lists put the variable name on one line and "value:" on a following one, and
+# YAML block scalars (password: |) put the value on the lines below the key.
+# name_line_pattern captures the variable name in group "key"; value_line_pattern
+# ends where the value starts. The value must follow within name_value_window lines.
+name_line_pattern = '''(?x)
+    ^[ \t]*(?:-[ \t]+)?["']?(?:name|key)["']?[ \t]*:[ \t]*
+    ["']?(?P<key>[A-Za-z_][\w.-]*)["']?[ \t]*,?[ \t]*(?:\#.*)?$
+'''
+value_line_pattern = '''^[ \t]*(?:-[ \t]+)?["']?value["']?[ \t]*:[ \t]*'''
+name_value_window = 2
+block_scalar_pattern = '''(?x)
+    ^[ \t]*(?:-[ \t]+)?["']?(?P<key>[A-Za-z_][\w.-]*)["']?[ \t]*:[ \t]*
+    [|>][+-]?\d?[ \t]*(?:\#.*)?$
+'''
+# A block scalar longer than this is cut off; what follows is not treated as the secret.
+block_scalar_max_lines = 20
+
+[redaction]
+# Hand-written config lines are far shorter; longer ones are minified or
+# generated. Past this length values are not parsed: everything after the
+# operator of a sensitive key is redacted instead.
+max_line_chars = 4096
+token_patterns = [
+    '(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})(?![A-Za-z0-9])',  # GitHub
+    '(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])',  # AWS access key IDs
+    '(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9])',  # Slack
+    'https://hooks\.slack\.com/services/[A-Za-z0-9_/-]+',  # Slack webhooks
+    '(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}',  # OpenAI-style keys
+    '(?<![A-Za-z0-9_])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}',  # Stripe
+    '(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}',  # Google API keys
+    '(?<![A-Za-z0-9_])gsk_[A-Za-z0-9]{20,}',  # Groq
+    '(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9])',  # npm
+    '(?<![A-Za-z0-9_-])pypi-[A-Za-z0-9_-]{50,}',  # PyPI
+    '(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,}',  # GitLab
+    '(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{30,}',  # Hugging Face
+    # JSON Web Tokens: base64url header and payload both start with '{"'.
+    '(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}',
+]
+# Group 1 is kept so the context stays readable; the rest of the match is redacted.
+prefixed_patterns = [
+    '(?i)((?<![A-Za-z0-9])Bearer[ \t]+)[A-Za-z0-9._~+/=-]{8,}',
+    '''(?i)((?<![A-Za-z0-9_-])Authorization["']?[ \t]*[:=][ \t]*["']?(?:Basic|token)[ \t]+)[A-Za-z0-9._~+/=-]+''',
+    # scheme://user:password@host; only the password is hidden. A port or a
+    # version tag (digits and dots only) is not a password, and
+    # docker://image:tag@sha256:... is a digest pin.
+    '((?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,30}://[^\s/?#@:]{0,256}:)(?![0-9.]+@)[^\s/?#@]{1,256}(?=@(?!sha\d+:))',
+    # curl -u user:password; arguments are skipped a word at a time, not a
+    # character at a time, and possessively, to keep the cost per "curl" small.
+    '''((?<![\w-])curl(?:[ \t]++[^ \t\r\n]++){0,15}?[ \t]++(?:-u|--user)[ \t]+["']?[^\s:"']*:)[^\s"']+''',
+]
+# PEM keys, plus the "PRIVATE KEY BLOCK" armour PGP uses.
+private_key_begin_pattern = '-----BEGIN [A-Za-z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----'
+private_key_end_pattern = '-----END [A-Za-z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----'
+# An RSA-4096 PEM is about 3.3 KB. Without an END marker inside this window the
+# rest of the text is treated as key material.
+max_private_key_chars = 16384
+value_marker = "[REDACTED]"
+token_marker = "[REDACTED TOKEN]"
+private_key_marker = "[REDACTED PRIVATE KEY]"
+
+# The rule catalog. The model may only use these ids; the <PREFIX>-099 rule of a
+# category is for a verified problem that no specific rule describes. A detector
+# names a [detectors.*] table below; an empty string means the model judges the rule.
+
+[[rules]]
+id = "HYG-001"
+category = "repository_hygiene"
+default_severity = "low"
+title = "No README at the repository root"
+evidence = "A root listing with no README file of any extension"
+recommendation = "Add a README describing purpose, setup and usage."
+acceptable_alternatives = ["README.rst", "README.txt", "readme.md"]
+detector = ""
+
+[[rules]]
+id = "HYG-002"
+category = "repository_hygiene"
+default_severity = "medium"
+title = "No .gitignore although the stack produces build artefacts"
+evidence = "A full listing with no .gitignore at the root or covering the source tree"
+recommendation = "Add a .gitignore for the stack build and environment artefacts."
+acceptable_alternatives = ["nested .gitignore covering the source tree"]
+detector = ""
+
+[[rules]]
+id = "HYG-003"
+category = "repository_hygiene"
+default_severity = "low"
+title = "The .gitignore misses key artefacts of the detected stack"
+evidence = "The .gitignore lines read, and the missing entry (__pycache__, node_modules, .venv, dist)"
+recommendation = "Add the missing artefact patterns to .gitignore."
+acceptable_alternatives = ["equivalent glob patterns"]
+detector = ""
+
+[[rules]]
+id = "HYG-004"
+category = "repository_hygiene"
+default_severity = "medium"
+title = "Generated or temporary files are tracked"
+evidence = "The tracked path (pyc, __pycache__, node_modules, egg-info, .DS_Store, log files, or build output under a top-level build/ or dist/)"
+recommendation = "Remove the files from version control and ignore them."
+acceptable_alternatives = ["intentional fixtures under tests/", "dist/ of a static-site deploy branch"]
+detector = "generated_files"
+
+[[rules]]
+id = "HYG-005"
+category = "repository_hygiene"
+default_severity = "low"
+title = "Large binary or archive committed"
+evidence = "The path and its size from the listing; only files over the size threshold ([audit].large_file_bytes, 5 MB) count"
+recommendation = "Move large binaries to releases, artifact storage or Git LFS."
+acceptable_alternatives = ["Git LFS pointers", "documented assets"]
+detector = ""
+
+[[rules]]
+id = "DEP-001"
+category = "dependency_management"
+default_severity = "medium"
+title = "Application dependencies are unpinned and there is no lockfile"
+evidence = "The manifest lines with loose specs (bare name, >= only, *, latest). The same root cause as DEP-002 for one manifest: report one of them"
+recommendation = "Pin versions and commit a lockfile."
+acceptable_alternatives = ["a lockfile is present", "library ranges in pyproject.toml"]
+detector = ""
+
+[[rules]]
+id = "DEP-002"
+category = "dependency_management"
+default_severity = "medium"
+title = "The ecosystem expects a lockfile but none is tracked"
+evidence = "An npm/yarn/pnpm, cargo, go modules, bundler or composer manifest read plus a listing showing no lockfile. A plain requirements.txt needs no lockfile"
+recommendation = "Generate and commit the lockfile."
+acceptable_alternatives = ["yarn.lock", "pnpm-lock.yaml", "package-lock.json", "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock", "plain requirements.txt", "uv.lock", "hashed requirements.txt"]
+detector = ""
+
+[[rules]]
+id = "DEP-003"
+category = "dependency_management"
+default_severity = "medium"
+title = "Conflicting dependency specs or competing lockfiles"
+evidence = "Both manifest lines with the conflicting versions, or the competing lockfile names"
+recommendation = "Keep one source of truth and align the versions."
+acceptable_alternatives = ["dev/prod split files that do not conflict"]
+detector = ""
+
+[[rules]]
+id = "DEP-004"
+category = "dependency_management"
+default_severity = "medium"
+title = "A third-party import is not declared in any manifest"
+evidence = "The import line and the manifests read, where the import maps to no declared package even through a known import/package alias"
+recommendation = "Declare the dependency in the manifest."
+acceptable_alternatives = ["stdlib modules", "declared optional extras", "yaml/PyYAML", "PIL/Pillow", "cv2/opencv-python", "sklearn/scikit-learn", "bs4/beautifulsoup4", "dateutil/python-dateutil", "jwt/PyJWT"]
+detector = ""
+
+[[rules]]
+id = "QUA-001"
+category = "code_quality"
+default_severity = "low"
+title = "No lint or format configuration locally or in CI"
+evidence = "Config files and CI steps read, with no linter or formatter in either"
+recommendation = "Add a linter or formatter and run it in CI."
+acceptable_alternatives = ["ruff", "flake8", "pylint", "black", "isort", "pre-commit", "eslint", "prettier", "biome", "golangci", "[tool.*] sections", "editorconfig plus a CI lint step"]
+detector = ""
+
+[[rules]]
+id = "QUA-002"
+category = "code_quality"
+default_severity = "low"
+title = "Maintainability problems in library code"
+evidence = "The offending line: bare except, except-pass, breakpoint() or pdb.set_trace(); nothing else counts"
+recommendation = "Handle errors explicitly and remove debug leftovers."
+acceptable_alternatives = ["scripts or examples folders"]
+detector = ""
+
+[[rules]]
+id = "TST-001"
+category = "testing"
+default_severity = "medium"
+title = "Source code with no tests"
+evidence = "A listing with source files and no test files anywhere"
+recommendation = "Add automated tests for the core behaviour."
+acceptable_alternatives = ["any test layout: tests/, test_*.py, *_test.go, *.spec.ts"]
+detector = ""
+
+[[rules]]
+id = "TST-002"
+category = "testing"
+default_severity = "medium"
+title = "Tests and CI exist but no CI job runs the tests"
+evidence = "The workflow files read and the absence of any test command"
+recommendation = "Add a CI job that runs the test suite."
+acceptable_alternatives = ["tox, nox, make test or npm test wrappers"]
+detector = ""
+
+[[rules]]
+id = "TST-003"
+category = "testing"
+default_severity = "high"
+title = "Tests disabled or certain to fail"
+evidence = "The line: unconditional skip of the suite, assert False, import of a missing module, syntax error"
+recommendation = "Enable the tests or fix the failure."
+acceptable_alternatives = ["conditional skips (platform or version)"]
+detector = ""
+
+[[rules]]
+id = "CI-001"
+category = "security"
+default_severity = "high"
+title = "Workflow grants write-all permissions"
+evidence = "The permissions: write-all line"
+recommendation = "Declare the minimum permissions per workflow or job."
+acceptable_alternatives = ["scoped minimal permissions"]
+detector = "workflow_write_all"
+
+[[rules]]
+id = "CI-002"
+category = "security"
+default_severity = "critical"
+title = "pull_request_target checks out PR head code and runs it"
+evidence = "The ref line with the PR head, plus the trigger and the run step"
+recommendation = "Use pull_request, or keep untrusted code away from privileged steps."
+acceptable_alternatives = ["pull_request trigger", "label-gated with no code execution"]
+detector = "pr_target_checkout"
+
+[[rules]]
+id = "CI-003"
+category = "ci_cd"
+default_severity = "medium"
+title = "No CI configuration"
+evidence = "A listing with no CI config of any provider"
+recommendation = "Add a CI workflow that builds and tests."
+acceptable_alternatives = ["GitHub Actions", "GitLab CI", "CircleCI", "Travis", "Azure Pipelines", "Azure DevOps", "Jenkinsfile", "Buildkite", "Bitbucket Pipelines", "Drone", "Woodpecker", "AppVeyor", "Cirrus", "TeamCity"]
+detector = ""
+
+[[rules]]
+id = "CI-004"
+category = "ci_cd"
+default_severity = "high"
+title = "A test or lint gate cannot fail"
+evidence = "The line: continue-on-error: true, || true, --exit-zero or exit 0 after a test or lint command"
+recommendation = "Remove the override so the step fails the job."
+acceptable_alternatives = ["continue-on-error on optional or experimental matrix entries"]
+detector = "ungated_check"
+
+[[rules]]
+id = "CI-005"
+category = "ci_cd"
+default_severity = "medium"
+title = "Test workflow never runs on push or PR to the default branch"
+evidence = "The on: block and the default branch from metadata"
+recommendation = "Trigger the workflow on push and pull_request for the default branch."
+acceptable_alternatives = ["reusable workflows called by others"]
+detector = ""
+
+[[rules]]
+id = "CI-006"
+category = "ci_cd"
+default_severity = "medium"
+title = "Validation is skipped or disabled"
+evidence = "The line: if: false, deselected tests, disabled job"
+recommendation = "Re-enable the check or document the condition."
+acceptable_alternatives = ["skips with a documented condition"]
+detector = ""
+
+[[rules]]
+id = "CI-007"
+category = "security"
+default_severity = "high"
+title = "Script injection through untrusted event data in run:"
+evidence = "The run: line containing the github.event or github.head_ref expression"
+recommendation = "Pass the value through env: and quote it in the script."
+acceptable_alternatives = ["value passed via env: and quoted"]
+detector = "script_injection"
+
+[[rules]]
+id = "CI-008"
+category = "security"
+default_severity = "medium"
+title = "Third-party action pinned to a branch or not pinned"
+evidence = "The uses: line with @main, @master or no ref"
+recommendation = "Pin the action to a release tag or commit SHA."
+acceptable_alternatives = ["tags or SHAs", "local ./ actions"]
+detector = "unpinned_action"
+
+[[rules]]
+id = "CI-009"
+category = "security"
+default_severity = "high"
+title = "Secrets echoed to logs or exposed to untrusted PR contexts"
+evidence = "The step that prints or passes the secret"
+recommendation = "Pass secrets through env: and never print them."
+acceptable_alternatives = ["masked usage via env:"]
+detector = ""
+
+[[rules]]
+id = "SEC-001"
+category = "security"
+default_severity = "critical"
+title = "Hard-coded credential in source or configuration"
+evidence = "The line with the credential name, value redacted"
+recommendation = "Load the credential from the environment or a secret manager and rotate it."
+acceptable_alternatives = ["env lookups", "secret managers", "obvious placeholders"]
+detector = "hardcoded_credential"
+
+[[rules]]
+id = "SEC-002"
+category = "security"
+default_severity = "critical"
+title = "Private key or known token format committed"
+evidence = "The line with the key block or token, redacted"
+recommendation = "Revoke the secret, remove it from history and use a secret store."
+acceptable_alternatives = ["public keys", "test keys explicitly marked fake"]
+detector = "secret_token"
+
+[[rules]]
+id = "SEC-003"
+category = "security"
+default_severity = "high"
+title = "Secret-bearing file committed"
+evidence = "The tracked path: .env, *.pem, id_rsa, credentials.json, .npmrc with _authToken, .pypirc"
+recommendation = "Remove the file from version control, rotate its secrets and ignore it."
+acceptable_alternatives = [".env.example", ".env.sample", ".env.template"]
+detector = "secret_file"
+
+[[rules]]
+id = "SEC-004"
+category = "security"
+default_severity = "medium"
+title = "Unsafe settings in shipped code"
+evidence = "The line: TLS verification off, DEBUG=True hard-wired, Flask debug=True in the entry point"
+recommendation = "Make the setting safe by default or gate it on an environment variable."
+acceptable_alternatives = ["debug gated by an env var"]
+detector = ""
+
+[[rules]]
+id = "CFG-001"
+category = "configuration"
+default_severity = "medium"
+title = "Machine-specific absolute path"
+evidence = "The line with the user-home path"
+recommendation = "Use relative paths or configuration."
+acceptable_alternatives = ["paths in docs examples", "container paths such as /app"]
+detector = "absolute_path"
+
+[[rules]]
+id = "CFG-002"
+category = "configuration"
+default_severity = "low"
+title = "Personal or local settings committed"
+evidence = "The tracked path: .idea/workspace.xml, personal .vscode/settings.json, *.local.*, local.settings.json"
+recommendation = "Remove the file and ignore it."
+acceptable_alternatives = ["shared .vscode/extensions.json", "launch.json", "team .editorconfig"]
+detector = ""
+
+[[rules]]
+id = "CFG-003"
+category = "configuration"
+default_severity = "medium"
+title = "Poor environment separation"
+evidence = "The line with a hard-coded database host or connection string, and no env-based config; other URLs do not count"
+recommendation = "Read environment-specific values from configuration."
+acceptable_alternatives = ["12-factor env lookups", "per-environment config files"]
+detector = ""
+
+[[rules]]
+id = "COL-001"
+category = "collaboration"
+default_severity = "high"
+title = "Unsafe PR automation"
+evidence = "The workflow line that auto-merges or auto-approves untrusted PRs or skips required checks"
+recommendation = "Gate automation on trusted authors and passing checks."
+acceptable_alternatives = ["Dependabot auto-merge limited to patch updates after checks"]
+detector = ""
+
+[[rules]]
+id = "COL-002"
+category = "collaboration"
+default_severity = "low"
+title = "Multi-contributor repo without contribution or review guidance"
+evidence = "git_log showing at least 3 distinct authors, plus a listing without CONTRIBUTING, PR template or CODEOWNERS"
+recommendation = "Add CONTRIBUTING, a PR template or CODEOWNERS."
+acceptable_alternatives = ["any one of them", "single-maintainer repositories"]
+detector = ""
+
+[[rules]]
+id = "BLD-001"
+category = "build_release"
+default_severity = "low"
+title = "Buildable artefact that CI never builds"
+evidence = "The Dockerfile or package manifest and the workflows lacking a build step; only when the repository has CI at all"
+recommendation = "Add a CI build step for the artefact."
+acceptable_alternatives = ["build done in a release workflow"]
+detector = ""
+
+[[rules]]
+id = "BLD-002"
+category = "build_release"
+default_severity = "high"
+title = "Risky release or deploy"
+evidence = "The line: deploy or publish on pull_request or any branch, publish without needs:, --force push"
+recommendation = "Restrict publishing to tags or main and require passing tests."
+acceptable_alternatives = ["tag-triggered release that needs a test job", "OIDC trusted publishing"]
+detector = ""
+
+[[rules]]
+id = "BLD-003"
+category = "build_release"
+default_severity = "medium"
+title = "Dockerfile risks: unpinned base image or curl piped to a shell"
+evidence = "The FROM line with :latest or no tag, or the curl | sh line"
+recommendation = "Pin the base image tag or digest and verify downloads."
+acceptable_alternatives = ["digest-pinned bases", "scratch", "ARG-based images", "installers verified by a checksum or signature"]
+detector = "dockerfile_risk"
+
+[[rules]]
+id = "HYG-099"
+category = "repository_hygiene"
+default_severity = "low"
+title = "Other repository hygiene problem"
+evidence = "The exact line or listing that shows the problem"
+recommendation = "Describe the concrete fix for the problem you verified."
+acceptable_alternatives = ["anything a more specific rule covers"]
+detector = ""
+
+[[rules]]
+id = "DEP-099"
+category = "dependency_management"
+default_severity = "low"
+title = "Other dependency management problem"
+evidence = "The exact line or listing that shows the problem"
+recommendation = "Describe the concrete fix for the problem you verified."
+acceptable_alternatives = ["anything a more specific rule covers"]
+detector = ""
+
+[[rules]]
+id = "QUA-099"
+category = "code_quality"
+default_severity = "low"
+title = "Other code quality problem"
+evidence = "The exact line or listing that shows the problem"
+recommendation = "Describe the concrete fix for the problem you verified."
+acceptable_alternatives = ["anything a more specific rule covers"]
+detector = ""
+
+[[rules]]
+id = "TST-099"
+category = "testing"
+default_severity = "low"
+title = "Other testing problem"
+evidence = "The exact line or listing that shows the problem"
+recommendation = "Describe the concrete fix for the problem you verified."
+acceptable_alternatives = ["anything a more specific rule covers"]
+detector = ""
+
+[[rules]]
+id = "CI-099"
+category = "ci_cd"
+default_severity = "low"
+title = "Other CI/CD problem"
+evidence = "The exact line or listing that shows the problem"
+recommendation = "Describe the concrete fix for the problem you verified."
+acceptable_alternatives = ["anything a more specific rule covers"]
+detector = ""
+
+[[rules]]
+id = "SEC-099"
+category = "security"
+default_severity = "low"
+title = "Other security problem"
+evidence = "The exact line or listing that shows the problem"
+recommendation = "Describe the concrete fix for the problem you verified."
+acceptable_alternatives = ["anything a more specific rule covers"]
+detector = ""
+
+[[rules]]
+id = "CFG-099"
+category = "configuration"
+default_severity = "low"
+title = "Other configuration problem"
+evidence = "The exact line or listing that shows the problem"
+recommendation = "Describe the concrete fix for the problem you verified."
+acceptable_alternatives = ["anything a more specific rule covers"]
+detector = ""
+
+[[rules]]
+id = "COL-099"
+category = "collaboration"
+default_severity = "low"
+title = "Other collaboration problem"
+evidence = "The exact line or listing that shows the problem"
+recommendation = "Describe the concrete fix for the problem you verified."
+acceptable_alternatives = ["anything a more specific rule covers"]
+detector = ""
+
+[[rules]]
+id = "BLD-099"
+category = "build_release"
+default_severity = "low"
+title = "Other build or release problem"
+evidence = "The exact line or listing that shows the problem"
+recommendation = "Describe the concrete fix for the problem you verified."
+acceptable_alternatives = ["anything a more specific rule covers"]
+detector = ""
+
+
+# Deterministic detectors. Patterns here run on files the model has already read
+# (and on the tracked path list for the path-based ones); anything they report is
+# still confirmed by the model. All path globs are matched against the casefolded
+# base name unless the key says otherwise.
+
+[audit]
+# These rules must be reported with the exact file, line and evidence a detector
+# produced; the other detectors are hints the model may confirm or discard.
+strict_rule_ids = ["SEC-001", "CI-001", "CI-002"]
+# Paths containing one of these (casefolded) are intentional samples.
+fixture_fragments = ["tests/fixtures/", "test/fixtures/", "testdata/", "tests/data/"]
+workflow_directory = ".github/workflows/"
+# Alternatives shown per rule in the prompt catalog; more costs tokens on every turn.
+prompt_alternatives_per_rule = 3
+# One noisy file or tree must not flood the model's context.
+max_findings_per_rule = 25
+# GitHub Actions "run:" keys. A block scalar (run: |) covers the more indented lines below.
+run_key_pattern = '^(?P<lead>[ \t]*(?:-[ \t]+)?)run[ \t]*:[ \t]*(?P<rest>.*?)[ \t]*$'
+block_scalar_start_pattern = '^[|>][+-]?\d?[ \t]*(?:#.*)?$'
+comment_pattern = '^[ \t]*#'
+# Files over this size are "large" for HYG-005; the model judges it from the listing sizes.
+large_file_bytes = 5242880
+
+[guards]
+# Checks FindingStore applies to model-reported findings before they join the report.
+# A severity may differ from the rule's default by this many steps.
+severity_max_steps = 1
+# A quote must appear within this many lines either side of the cited line.
+grounding_radius = 2
+# SEC-* findings in fixture paths ([audit].fixture_fragments) are rejected, except
+# for rules whose evidence is a known token format.
+fixture_rule_prefixes = ["SEC-"]
+fixture_exempt_rules = ["SEC-002"]
+# Template copies of config files hold placeholders by design.
+template_suffixes = [".example", ".sample", ".template"]
+# Matched as a path prefix or as a directory inside the path.
+vendored_fragments = ["vendor/", "third_party/", "node_modules/"]
+# Documentation shows code snippets, not live configuration.
+doc_rule_prefixes = ["SEC-", "CFG-"]
+doc_suffixes = [".md", ".markdown", ".rst"]
+doc_prefixes = ["docs/", "doc/"]
+# Repository settings are not visible in the files.
+remote_setting_keywords = ["branch protection", "required review", "repository settings", "protected branch"]
+
+[detectors.hardcoded_credential]
+# In these files only a quoted string literal counts as a value; a bare
+# identifier, attribute access or call is code, not a credential.
+code_globs = [
+    "*.py", "*.js", "*.jsx", "*.ts", "*.tsx", "*.go", "*.java", "*.rb", "*.php", "*.cs",
+    "*.kt", "*.kts", "*.rs", "*.swift", "*.scala", "*.gradle", "*.groovy",
+]
+# Configuration formats where an unquoted value is the value.
+unquoted_globs = [
+    "*.env", ".env", ".env.*", "*.ini", "*.properties", "*.cfg", "*.conf", "*.yml",
+    "*.yaml", "*.toml", "*.sh", "*.bash", "dockerfile*", "*.tf", "*.tfvars", "*.json", "*.xml",
+]
+# A quoted literal in code is deliberate, so a shorter value still counts
+# (password = "admin"); unquoted config values keep min_secret_length.
+quoted_literal_min_length = 5
+# In these formats a value with a space is prose, and a value equal to its own
+# key is a schema entry ("password": "password"), not a credential.
+prose_globs = ["*.json"]
+# Inner text of a quoted literal that is not a real secret.
+literal_skip_patterns = [
+    '^(.)\1{3,}$',
+    '^\{\{.*\}\}$',
+    '^\$',
+    '(?i)^(?:none|null|nil|undefined)$',
+    '(?i)^(?:process\.env|config\.|settings\.|os\.|env\.|self\.)',
+]
+
+[detectors.secret_token]
+# A line mentioning one of these is a documented fake, not a leak.
+fake_markers = ["example", "fake", "dummy", "not-a-secret", "placeholder", "xxxx"]
+
+[detectors.secret_file]
+path_globs = [".env", ".env.*", "*.env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials.json"]
+safe_suffixes = [".example", ".sample", ".template", ".dist", ".tpl", ".defaults"]
+# A dot-separated part of an env file name that marks a template or a non-secret
+# profile (.env.test, example.env).
+safe_env_parts = ["example", "sample", "template", "dist", "test", "development", "defaults"]
+env_globs = [".env", ".env.*", "*.env"]
+# Only reported when the file was read and the pattern matches a literal value.
+content_patterns = { ".npmrc" = '_authToken[ \t]*=[ \t]*(?!\$\{|[ \t]|$)\S{8,}', ".pypirc" = '(?im)^[ \t]*password[ \t]*[:=][ \t]*(?!\$\{|[ \t]|$)\S{8,}' }
+# Reported only when the file was read and holds a private key; a public
+# certificate or an unread key file is not evidence.
+private_key_globs = ["*.pem", "*.key"]
+
+[detectors.workflow_write_all]
+pattern = '(?i)[ \t]*permissions[ \t]*:[ \t]*write-all[ \t]*(?:#.*)?$'
+
+[detectors.pr_target_checkout]
+trigger_pattern = '(?i)\bpull_request_target\b'
+checkout_pattern = '(?i)[ \t]*(?:-[ \t]*)?uses[ \t]*:[ \t]*actions/checkout(?:@|[ \t]|$)'
+# Patterns here are matched against one line at a time. An untrusted ref is the PR
+# head by sha or ref, the merge ref, the head branch name or the fork repository;
+# any run: step after such a checkout executes that code.
+untrusted_ref_pattern = '''(?ix)
+    [ \t]*(?:-[ \t]*)?(?:ref|repository)[ \t]*:[ \t]*
+    ["']?(?:
+        \$\{\{[ \t]*(?:github\.event\.pull_request\.head\.(?:sha|ref|repo\.full_name)|github\.head_ref)[ \t]*\}\}
+      | refs/pull/.*?/(?:merge|head)
+    )["']?
+    [ \t]*(?:\#.*)?$
+'''
+related_evidence = "Related workflow evidence: pull_request_target trigger, actions/checkout, and a project test/build command."
+
+[detectors.ungated_check]
+# A test or lint command at the start of a command segment (start of the run, or
+# after && ; |), so "pip install pytest || true" and "echo pytest" are not gates.
+# The override must follow it on the same line.
+command_pattern = '''(?ix)
+    (?:^|&&|;|\|)[ \t]*
+    (?:(?:python[\d.]*[ \t]+-m|poetry[ \t]+run|pipenv[ \t]+run|uv[ \t]+run|npx)[ \t]+)?
+    (?:pytest|unittest|tox|nox|npm[ \t]+(?:run[ \t]+)?(?:test|lint)|yarn[ \t]+(?:run[ \t]+)?(?:test|lint)|pnpm[ \t]+(?:run[ \t]+)?(?:test|lint)|go[ \t]+test|cargo[ \t]+(?:test|clippy)|mvn[ \t]+test|gradle[ \t]+test|make[ \t]+(?:test|lint|check)|ruff|flake8|pylint|mypy|eslint|black|isort|golangci-lint|phpunit|rspec|jest|vitest)\b
+'''
+override_pattern = '(?i)(?:\|\|[ \t]*(?:(?:true|exit[ \t]+0)\b|:(?!\w))|--exit-zero\b|;[ \t]*exit[ \t]+0\b|&&[ \t]*exit[ \t]+0\b)'
+# A job that is allowed to fail by design is not a broken gate: its id or name, or a
+# matrix.experimental flag in its body.
+experimental_job_pattern = '(?i)experimental|nightly|allow[-_]?fail|canary'
+continue_on_error_pattern = '''(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?continue-on-error[ \t]*:[ \t]*["']?true["']?[ \t]*(?:#.*)?$'''
+step_start_pattern = '^(?P<indent>[ \t]*)-[ \t]'
+# A step's "name:" often mentions the command it runs; only run lines count.
+name_pattern = '(?i)^[ \t]*(?:-[ \t]+)?name[ \t]*:'
+
+[detectors.script_injection]
+# Only fields an outside user writes: titles, bodies, branch names, commit and page
+# metadata. Numbers, SHAs, logins and ids are not attacker-controlled text.
+expression_pattern = '''(?ix)
+    \$\{\{[ \t]*(?:
+        github\.event\.(?:
+            (?:pull_request|issue|comment|review|review_comment|discussion|head_commit)
+          | (?:commits|pages)\[[^\]]*\]
+        )\.(?:title|body|head\.ref|head\.label|head\.repo\.default_branch|message|name|email|page_name|author\.name|author\.email)
+      | github\.head_ref
+    )[ \t]*\}\}
+'''
+
+[detectors.unpinned_action]
+uses_pattern = '''^[ \t]*(?:-[ \t]+)?uses[ \t]*:[ \t]*["']?(?P<ref>[^\s"'#]+)'''
+local_prefixes = ["./", "docker://"]
+branch_refs = ["main", "master", "develop", "dev"]
+
+[detectors.generated_files]
+directory_globs = ["__pycache__", "node_modules", "*.egg-info", ".pytest_cache"]
+# build/ and dist/ also hold hand-written sources in many projects: they count only
+# at the repository root and only for files that look like build output.
+top_level_directories = ["build", "dist"]
+artefact_suffixes = [".js", ".map", ".whl", ".tar.gz", ".class", ".jar", ".o", ".so", ".exe", ".pyc", ".egg"]
+file_globs = ["*.pyc", ".DS_Store", "Thumbs.db", "*.log", "coverage.xml", ".coverage"]
+
+[detectors.absolute_path]
+patterns = [
+    # One or two backslashes: source code usually writes Windows paths escaped ("C:\\Users\\x").
+    '(?<![A-Za-z0-9])[A-Za-z]:(?:\\{1,2}|/)Users(?:\\{1,2}|/)(?P<user>[A-Za-z0-9._-]+)(?:\\{1,2}|/)',
+    '(?<![\w.~-])/home/(?P<user>[A-Za-z0-9._-]+)/',
+    '(?<![\w.~-])/Users/(?P<user>[A-Za-z0-9._-]+)/',
+]
+# Account names of CI runners, containers and examples, not a developer machine.
+ignored_users = [
+    "runner", "vsts", "user", "username", "youruser", "you", "me", "name", "ubuntu", "node", "app",
+    "appuser", "www-data", "public", "default", "shared", "circleci", "jenkins", "travis", "buildkite",
+    "docker", "all users", "vscode", "codespace", "gitpod", "jovyan", "vagrant", "ec2-user", "centos",
+    "debian", "alice", "bob", "john", "jane", "foo", "bar", "example",
+]
+skip_globs = ["*.md", "*.markdown", "*.rst", "test_*", "*_test.*"]
+skip_prefixes = ["docs/", "doc/"]
+# Test code names machines on purpose; matched against every directory of the path.
+skip_directories = ["tests", "test", "spec", "__tests__"]
+
+[detectors.dockerfile_risk]
+file_globs = ["dockerfile", "dockerfile.*", "*.dockerfile"]
+from_pattern = '''(?i)^[ \t]*FROM[ \t]+(?:--platform=\S+[ \t]+)?(?P<image>\S+)(?:[ \t]+AS[ \t]+(?P<alias>\S+))?[ \t]*(?:#.*)?$'''
+mutable_tag = "latest"
+allowed_images = ["scratch"]
+# Digests and ARG/ENV-based images cannot be judged from the Dockerfile alone.
+reference_markers = ["@", "$"]
+pipe_pattern = '(?i)\b(?:curl|wget)\b[^|\n]*\|[ \t]*(?:sudo[ \t]+)?(?:ba|z)?sh\b'

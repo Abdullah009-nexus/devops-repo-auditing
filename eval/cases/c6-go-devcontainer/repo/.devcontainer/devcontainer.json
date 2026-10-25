@@ -1,0 +1,7 @@
+{
+  "name": "builder",
+  "image": "mcr.microsoft.com/devcontainers/go:1.22",
+  "remoteUser": "vscode",
+  "workspaceFolder": "/home/vscode/builder",
+  "mounts": ["source=${localWorkspaceFolder},target=/home/vscode/builder,type=bind"]
+}

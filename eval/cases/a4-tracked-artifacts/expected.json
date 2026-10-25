@@ -1,0 +1,17 @@
+{
+  "category": "A",
+  "violations": [
+    {
+      "rule_id": "HYG-004",
+      "category": "repository_hygiene",
+      "file": "__pycache__/app.cpython-311.pyc",
+      "line": null
+    },
+    {
+      "rule_id": "HYG-004",
+      "category": "repository_hygiene",
+      "file": "debug.log",
+      "line": null
+    }
+  ]
+}

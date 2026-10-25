@@ -1,0 +1,119 @@
+# Every tunable the agent reads. Each key must be present here; a --config
+# file or AUDITOR_<SECTION>_<KEY> environment variable may override it.
+
+[github]
+api_root = "https://api.github.com"
+raw_root = "https://raw.githubusercontent.com"
+clone_root = "https://github.com"
+# GitHub's own naming rules; anything else is refused before any URL is built.
+owner_pattern = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})'
+name_pattern = '[A-Za-z0-9._-]{1,100}'
+user_agent = "devops-repository-auditing-agent/1.0"
+request_timeout_seconds = 15
+max_response_bytes = 8388608        # 8 MiB, repository metadata and tree
+commit_history_bytes = 2097152      # 2 MiB
+metadata_max_chars = 200            # per string field returned by get_repo_metadata
+
+[repository]
+max_file_bytes = 262144             # 256 KiB
+max_listed_files = 5000
+# "clone" makes a hardened shallow clone and falls back to the API if git is
+# missing or the clone fails; "api" never runs git.
+backend = "clone"
+clone_depth = 50
+clone_timeout_seconds = 120
+max_repo_size_mb = 500              # checked against GitHub metadata before cloning
+# Budgets on the cloned tree, checked from `git ls-tree` because GitHub's packed
+# size can be stale or zero. They are well above typical service repositories
+# (a few thousand files, tens of MB) yet stop pathological trees; anything over
+# them is audited through the API instead.
+max_checkout_files = 20000
+max_checkout_mb = 1024              # sum of blob sizes
+max_tree_listing_bytes = 33554432   # 32 MiB of `git ls-tree` output
+max_list_entries = 1000             # paths returned by one list_files call
+max_read_lines = 400                # lines returned by one read_file call
+# Files above max_file_bytes can still be read by line range up to this size.
+max_range_file_bytes = 2097152      # 2 MiB
+git_executable = "git"
+# Only these variables reach git; everything else (API keys, tokens) stays out of
+# the subprocess. Matched case-insensitively, since Windows folds names.
+git_env_allowlist = [
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
+    "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "TMPDIR",
+    "LANG", "LC_ALL",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+]
+temp_dir_prefix = "repo-audit-"
+
+[search]
+max_files = 100
+max_matches = 50
+max_pattern_length = 200
+max_line_chars = 300                # matched line text shown per match
+# Regex mode skips longer lines, which bounds backtracking on minified files.
+max_scan_line_chars = 1000
+# Python's re has no timeout, so a repeated group that itself repeats, e.g. (a+)+,
+# can backtrack exponentially. Such regex patterns are refused before compiling.
+nested_repeat_pattern = '\((?:[^()\\]|\\.)*(?:[+*]|\{\d*,\d*\})(?:[^()\\]|\\.)*\)(?:[+*]|\{\d*,\d*\})'
+# A repeated group that contains alternation, e.g. (a|aa)+, backtracks exponentially
+# when the alternatives overlap. A bounded count such as {2} is allowed.
+alternation_repeat_pattern = '\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)(?:[+*]|\{\d+,\})'
+searchable_suffixes = [
+    ".cfg", ".conf", ".css", ".dockerfile", ".env", ".example", ".go",
+    ".ini", ".java", ".js", ".json", ".md", ".mk", ".php", ".properties",
+    ".py", ".rb", ".rs", ".sh", ".sql", ".tf", ".toml", ".ts", ".txt",
+    ".xml", ".yaml", ".yml",
+]
+searchable_filenames = [
+    "dockerfile", "makefile", "procfile", "jenkinsfile",
+    ".dockerignore", ".gitignore",
+]
+
+[git_log]
+default_commits = 10                # when git_log is called without max_commits
+max_commits = 50                    # at most 100 (GitHub's per_page limit); clone_depth bounds the clone
+message_max_chars = 1000
+sha_length = 12
+max_output_bytes = 2097152          # 2 MiB of `git log` output on the clone backend
+max_files_per_commit = 20           # changed paths listed per commit (clone backend only)
+
+[workflows]
+directory = ".github/workflows"
+suffixes = [".yml", ".yaml"]
+max_files = 50
+max_items_per_file = 100            # triggers, permissions lines and jobs, each
+
+[agent]
+max_turns = 30
+max_tool_calls = 80
+max_tool_output_chars = 30000
+max_report_findings = 100
+max_wall_seconds = 600              # investigation window
+# Finalize only reports what is already found, so it gets a short window of its own.
+finalize_wall_seconds = 120
+finalize_turns = 2                  # report-only turns granted once a budget is spent
+max_finding_field_chars = 2000      # longest description/evidence/recommendation accepted
+max_text_replies = 2                # consecutive replies without a tool call before the run stops
+
+[context]
+keep_recent_tool_results = 6        # newest tool results always sent in full
+max_total_chars = 200000            # message content budget before older results are stubbed
+
+[trace]
+enabled = true
+directory = "logs"
+max_string_chars = 500              # longer strings are cut before they are written
+
+[eval]
+line_tolerance = 2                  # lines a cited line may differ from the label
+
+[llm]
+default_base_url = "https://api.openai.com/v1"
+user_agent = "devops-repository-auditing-agent/1.0"
+request_timeout_seconds = 60
+max_response_bytes = 2097152        # 2 MiB
+temperature = 0.1                   # low: audits should be repeatable
+max_retries = 4                     # extra attempts after the first, for transient errors
+backoff_base_seconds = 1.0
+backoff_max_seconds = 30.0          # also caps a provider's Retry-After

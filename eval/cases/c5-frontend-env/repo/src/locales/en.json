@@ -1,0 +1,8 @@
+{
+  "login": {
+    "username": "Username",
+    "password": "Password",
+    "token": "Enter your token",
+    "submit": "Sign in"
+  }
+}

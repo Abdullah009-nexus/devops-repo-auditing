@@ -1,0 +1,11 @@
+{
+  "category": "A",
+  "violations": [
+    {
+      "rule_id": "CI-001",
+      "category": "security",
+      "file": ".github/workflows/ci.yml",
+      "line": 5
+    }
+  ]
+}

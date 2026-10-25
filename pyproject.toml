@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devops-repo-auditor"
+version = "0.1.0"
+description = "LLM-directed, read-only auditor for DevOps practices in public GitHub repositories."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+devops-audit = "agent:main"
+
+[tool.setuptools]
+py-modules = ["agent", "tools"]
+packages = ["auditor"]
+
+[tool.setuptools.package-data]
+auditor = ["config/*.toml", "prompts/*.txt"]

@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -5,288 +6,280 @@ import tempfile
 import urllib.error
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 import agent
-from tools import GitHubRepository, RepositoryAddress
+from auditor.findings import FINISH_AUDIT, REPORT_FINDING
+from auditor.llm_client import LLMClient
+from auditor.loop import AgentError, AuditAgent
+from auditor.trace import Tracer
+from tests.support import default_settings
+from tests.test_loop import FINDING, FakeClient, call, make_repository, reply
+from tests.test_repository import FakeGit
+
+ENVIRON = {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "test-model"}
+REPO_URL = "https://github.com/example/project"
 
 
-def completion_message(message):
-    return {"choices": [{"message": message}]}
+class ProviderFailureTests(unittest.TestCase):
+    """The real client behind the loop: transport failures stay explicit and fatal."""
 
+    def audit_with(self, urlopen):
+        settings = default_settings()
+        client = LLMClient(settings.llm, ENVIRON, sleep=lambda seconds: None)
+        with patch("auditor.llm_client._opener.open", urlopen):
+            AuditAgent(make_repository(settings), settings, client, Tracer(None, 500)).run()
 
-class AgentTests(unittest.TestCase):
-    def setUp(self):
-        self.repository = GitHubRepository.__new__(GitHubRepository)
-        self.repository.address = RepositoryAddress.parse(
-            "https://github.com/example/project"
-        )
-        self.repository.files = {"config.py": {"type": "blob", "size": 10}}
-        self.repository._read_cache = {"config.py": "setting = True\n"}
-        self.repository._inspected_paths = {"config.py"}
-
-    def test_agent_performs_follow_up_tool_calls_before_reporting(self):
-        first = completion_message(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call-search",
-                        "type": "function",
-                        "function": {
-                            "name": "search_code",
-                            "arguments": json.dumps({"pattern": "debug"}),
-                        },
-                    }
-                ],
-            }
-        )
-        second = completion_message(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call-read",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": json.dumps({"path": "config.py"}),
-                        },
-                    }
-                ],
-            }
-        )
-        final_report = {
-            "repository": self.repository.address.url,
-            "violations": [],
-        }
-        final = completion_message(
-            {"role": "assistant", "content": json.dumps(final_report)}
-        )
-        with (
-            patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "test-model"}),
-            patch.object(agent, "_chat_completion", side_effect=[first, second, final]) as chat,
-            patch("agent.RepositoryTools.call", side_effect=[
-                {"pattern": "debug", "matches": []},
-                {"path": "config.py", "content": "1: setting = True"},
-            ]) as tool_call,
-        ):
-            result = agent.run_agent(self.repository)
-        self.assertEqual(result["violations"], [])
-        self.assertEqual(chat.call_count, 3)
-        self.assertEqual(tool_call.call_count, 2)
-        final_messages = chat.call_args_list[-1].args[0]
-        self.assertEqual(final_messages[-1]["role"], "tool")
-        self.assertIn('"matches": []', final_messages[-3]["content"])
-
-    def test_report_rejects_uninspected_file_evidence(self):
-        report = {
-            "repository": self.repository.address.url,
-            "violations": [
-                {
-                    "rule_id": "CUSTOM-001",
-                    "category": "security",
-                    "severity": "high",
-                    "file": "unknown.py",
-                    "line": 1,
-                    "description": "Unsupported issue",
-                    "evidence": "Not observed",
-                    "recommendation": "Investigate",
-                }
-            ],
-        }
-        with self.assertRaises(agent.AgentError):
-            agent.validate_report(json.dumps(report), self.repository)
-
-    def test_report_redacts_secrets_and_deduplicates(self):
-        finding = {
-            "rule_id": "CUSTOM-001",
-            "category": "security",
-            "severity": "high",
-            "file": "config.py",
-            "line": 1,
-            "description": "API token is exposed",
-            "evidence": "TOKEN = supersecretvalue",
-            "recommendation": "Use a secret manager",
-        }
-        report = {
-            "repository": self.repository.address.url,
-            "violations": [finding, finding],
-        }
-        validated = agent.validate_report(json.dumps(report), self.repository)
-        self.assertEqual(len(validated["violations"]), 1)
-        self.assertNotIn("supersecretvalue", json.dumps(validated))
-
-    def test_report_requires_exact_evidence_for_known_audit_rules(self):
-        self.repository._read_cache["config.py"] = (
-            'API_TOKEN = "local_test_token_value_12345"\n'
-        )
-        report = {
-            "repository": self.repository.address.url,
-            "violations": [
-                {
-                    "rule_id": "SEC-001",
-                    "category": "security",
-                    "severity": "high",
-                    "file": "config.py",
-                    "line": 1,
-                    "description": "Credential hardcoded in source.",
-                    "evidence": "API_TOKEN = [REDACTED]",
-                    "recommendation": "Use environment-based secret management.",
-                }
-            ],
-        }
-        result = agent.validate_report(json.dumps(report), self.repository)
-        self.assertEqual(result["violations"][0]["rule_id"], "SEC-001")
-        report["violations"][0]["evidence"] = "This file has a security problem."
-        with self.assertRaisesRegex(agent.AgentError, "deterministic audit rule"):
-            agent.validate_report(json.dumps(report), self.repository)
-
-    def test_rejects_invalid_report_json(self):
-        with self.assertRaises(agent.AgentError):
-            agent.validate_report("not json", self.repository)
-
-    def test_tool_result_returns_validation_errors_to_model(self):
-        result = agent._tool_result(
-            agent.RepositoryTools(self.repository),
-            "read_file",
-            json.dumps({"path": "config.py", "unexpected": True}),
-        )
-        self.assertIn("unsupported arguments", json.loads(result)["error"])
-
-    def test_agent_rejects_empty_provider_choices(self):
-        with (
-            patch.dict(
-                os.environ,
-                {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "test-model"},
-            ),
-            patch.object(agent, "_chat_completion", return_value={"choices": []}),
-            self.assertRaisesRegex(agent.AgentError, "completion choice"),
-        ):
-            agent.run_agent(self.repository)
-
-    def test_agent_enforces_tool_call_limit_before_dispatch(self):
-        message = completion_message(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": f"call-{index}",
-                        "type": "function",
-                        "function": {"name": "list_files", "arguments": "{}"},
-                    }
-                    for index in range(agent.MAX_TOOL_CALLS + 1)
-                ],
-            }
-        )
-        with (
-            patch.dict(
-                os.environ,
-                {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "test-model"},
-            ),
-            patch.object(agent, "_chat_completion", return_value=message),
-            patch("agent.RepositoryTools.call") as tool_call,
-            self.assertRaisesRegex(agent.AgentError, "inspection limit"),
-        ):
-            agent.run_agent(self.repository)
-        tool_call.assert_not_called()
-
-    def test_agent_enforces_reasoning_turn_limit(self):
-        tool_response = completion_message(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call-list",
-                        "type": "function",
-                        "function": {"name": "list_files", "arguments": "{}"},
-                    }
-                ],
-            }
-        )
-        with (
-            patch.dict(
-                os.environ,
-                {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "test-model"},
-            ),
-            patch.object(
-                agent, "_chat_completion", return_value=tool_response
-            ) as chat,
-            patch("agent.RepositoryTools.call", return_value={"files": []}),
-            patch.object(agent, "MAX_AGENT_TURNS", 2),
-            self.assertRaisesRegex(agent.AgentError, "reasoning limit"),
-        ):
-            agent.run_agent(self.repository)
-        self.assertEqual(chat.call_count, 2)
-
-    @patch("agent.urllib.request.urlopen")
-    def test_provider_http_failure_is_explicit(self, urlopen):
-        urlopen.side_effect = urllib.error.HTTPError(
+    def test_http_failure_is_explicit_and_hides_the_provider_body(self):
+        error = urllib.error.HTTPError(
             "https://api.example.com/chat/completions",
             429,
             "rate limited",
             {},
             io.BytesIO(b"provider error details must not be exposed"),
         )
-        try:
-            with self.assertRaisesRegex(agent.AgentError, "HTTP 429"):
-                agent._chat_completion(
-                    [],
-                    api_key="test-key",
-                    model="test-model",
-                    base_url="https://api.example.com/v1",
-                )
-        finally:
-            urlopen.side_effect.close()
+        self.addCleanup(error.close)
+        with self.assertRaisesRegex(AgentError, "HTTP 429") as caught:
+            self.audit_with(Mock(side_effect=error))
+        self.assertNotIn("details", str(caught.exception))
 
-    @patch("agent.urllib.request.urlopen")
-    def test_provider_timeout_is_explicit(self, urlopen):
-        urlopen.side_effect = TimeoutError()
-        with self.assertRaisesRegex(agent.AgentError, "timed out"):
-            agent._chat_completion(
-                [],
-                api_key="test-key",
-                model="test-model",
-                base_url="https://api.example.com/v1",
-            )
+    def test_timeout_is_explicit(self):
+        with self.assertRaisesRegex(AgentError, "timed out"):
+            self.audit_with(Mock(side_effect=TimeoutError()))
 
-    @patch("agent.urllib.request.urlopen")
-    def test_invalid_provider_json_is_explicit(self, urlopen):
+    def test_invalid_provider_json_is_explicit(self):
+        urlopen = MagicMock()
         urlopen.return_value.__enter__.return_value.read.return_value = b"not json"
-        with self.assertRaisesRegex(agent.AgentError, "invalid JSON"):
-            agent._chat_completion(
-                [],
-                api_key="test-key",
-                model="test-model",
-                base_url="https://api.example.com/v1",
-            )
+        with self.assertRaisesRegex(AgentError, "invalid JSON"):
+            self.audit_with(urlopen)
 
+
+class CliTests(unittest.TestCase):
+    ARGV = ["--repo", REPO_URL, "--output", "report.json"]
+
+    def setUp(self):
+        self.workspaces = []
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(contextlib.chdir(directory.name))
+        stack.enter_context(patch.dict(os.environ, ENVIRON))
+        stack.enter_context(
+            patch(
+                "auditor.repository._request_json",
+                return_value={"private": False, "default_branch": "main", "size": 1},
+            )
+        )
+        self.git = FakeGit({"app.py": b"print('x')\n"})
+        stack.enter_context(patch("auditor.repository.subprocess.Popen", side_effect=self._clone))
+        stack.enter_context(
+            patch("urllib.request.urlopen", side_effect=AssertionError("network used"))
+        )
+        stack.enter_context(
+            patch("auditor.llm_client._opener.open", side_effect=AssertionError("network used"))
+        )
+        self.stdout = stack.enter_context(patch("agent.sys.stdout", new_callable=io.StringIO))
+        self.stderr = stack.enter_context(patch("agent.sys.stderr", new_callable=io.StringIO))
+        self.directory = Path(directory.name)
+        self.output = self.directory / "report.json"
+
+    def _clone(self, args, **kwargs):
+        if "clone" in args:
+            self.workspaces.append(Path(args[-1]).parent)
+        return self.git(args, **kwargs)
+
+    def _run_agent_that(self, outcome):
+        def run_agent(repository, settings, client, tracer):
+            self.assertEqual(repository.source.backend, "clone")
+            self.assertTrue(repository.source.root.is_dir())
+            return outcome(repository)
+
+        return patch.object(agent, "run_agent", side_effect=run_agent)
+
+    def test_clone_is_removed_after_a_successful_audit(self):
+        report = {"repository": REPO_URL, "violations": []}
+        with self._run_agent_that(lambda repository: report):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(self.output.read_text(encoding="utf-8")), report)
+        self.assertEqual(len(self.workspaces), 1)
+        self.assertFalse(self.workspaces[0].exists())
+
+    def test_clone_is_removed_when_the_audit_fails(self):
+        def fail(repository):
+            raise AgentError("provider unavailable")
+
+        with self._run_agent_that(fail):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 1)
+        self.assertIn("provider unavailable", self.stderr.getvalue())
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.workspaces[0].exists())
+
+    def test_clone_is_removed_when_an_unexpected_error_escapes_main(self):
+        def crash(repository):
+            raise RuntimeError("unexpected")
+
+        with self._run_agent_that(crash), self.assertRaisesRegex(RuntimeError, "unexpected"):
+            agent.main(self.ARGV)
+        self.assertFalse(self.workspaces[0].exists())
+
+    def test_report_that_breaks_the_contract_is_not_written(self):
+        with self._run_agent_that(lambda repository: {"repository": REPO_URL}):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 1)
+        self.assertFalse(self.output.exists())
+
+    def test_unwritable_output_exits_1(self):
+        (self.directory / "blocked").write_text("a file", encoding="utf-8")
+        report = {"repository": REPO_URL, "violations": []}
+        with self._run_agent_that(lambda repository: report):
+            result = agent.main(["--repo", REPO_URL, "--output", "blocked/report.json"])
+        self.assertEqual(result, 1)
+        self.assertTrue(self.stderr.getvalue().startswith("Error: "))
+
+    def test_missing_api_key_exits_2_before_any_clone(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 2)
+        self.assertIn("OPENAI_API_KEY", self.stderr.getvalue())
+        self.assertEqual(self.workspaces, [])
+
+    def test_missing_model_exits_2(self):
+        with patch.dict(os.environ, {"OPENAI_MODEL": ""}):
+            self.assertEqual(agent.main(self.ARGV), 2)
+        self.assertIn("OPENAI_MODEL", self.stderr.getvalue())
+
+    def test_invalid_repository_url_exits_2(self):
+        result = agent.main(["--repo", "https://example.com/not/github", "--output", "report.json"])
+        self.assertEqual(result, 2)
+        self.assertTrue(self.stderr.getvalue().startswith("Error: "))
+        self.assertEqual(self.workspaces, [])
+
+    def test_unreachable_repository_exits_1(self):
+        failure = agent.RepositoryError("repository unavailable")
+        with patch.object(agent, "GitHubRepository", side_effect=failure):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 1)
+        self.assertIn("repository unavailable", self.stderr.getvalue())
+
+    def test_argparse_rejects_missing_arguments_with_exit_2(self):
+        with self.assertRaises(SystemExit) as caught:
+            agent.main(["--repo", REPO_URL])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_provider_failure_mid_run_exits_1_and_writes_no_report(self):
+        client = FakeClient(
+            reply(call("list_files", {}, "a")),
+            agent.LLMError("LLM provider request failed with HTTP 503."),
+        )
+        with patch.object(agent, "LLMClient", return_value=client):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 1)
+        self.assertIn("HTTP 503", self.stderr.getvalue())
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.workspaces[0].exists())
+
+    def test_invalid_config_exits_2_before_any_clone(self):
+        with patch.dict(os.environ, {"AUDITOR_AGENT_MAX_TURNS": "many"}):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 2)
+        self.assertIn("AUDITOR_AGENT_MAX_TURNS", self.stderr.getvalue())
+        self.assertEqual(self.workspaces, [])
+
+    def test_unreadable_config_file_exits_2(self):
+        result = agent.main([*self.ARGV, "--config", str(self.directory / "missing.toml")])
+        self.assertEqual(result, 2)
+        self.assertEqual(self.workspaces, [])
+
+    def test_provider_retries_exhausted_exits_1_and_writes_no_report(self):
+        failure = urllib.error.HTTPError(
+            "https://api.example.com/chat/completions", 503, "unavailable", {}, io.BytesIO(b"")
+        )
+        self.addCleanup(failure.close)
+        with (
+            patch("auditor.llm_client.time.sleep"),
+            patch("auditor.llm_client._opener.open", Mock(side_effect=failure)),
+        ):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 1)
+        self.assertIn("HTTP 503", self.stderr.getvalue())
+        self.assertFalse(self.output.exists())
+
+    def test_completed_audit_with_no_findings_exits_0_with_an_empty_array(self):
+        client = FakeClient(reply(call(FINISH_AUDIT, {"summary": "nothing found"}, "a")))
+        with patch.object(agent, "LLMClient", return_value=client):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(self.output.read_text(encoding="utf-8")),
+            {"repository": REPO_URL, "violations": []},
+        )
+
+    def test_full_run_writes_a_contract_valid_report_and_a_trace(self):
+        client = FakeClient(
+            reply(call("list_files", {}, "a")),
+            reply(call("read_file", {"path": "app.py"}, "b")),
+            reply(
+                call(
+                    REPORT_FINDING,
+                    {**FINDING, "file": "app.py", "line": 1, "evidence": "print('x')", "quote": "print('x')"},
+                    "c",
+                ),
+                call(FINISH_AUDIT, {"summary": "done"}, "d"),
+            ),
+        )
+        with patch.object(agent, "LLMClient", return_value=client):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 0)
+        report = json.loads(self.output.read_text(encoding="utf-8"))
+        self.assertEqual(set(report), {"repository", "violations"})
+        self.assertEqual(report["violations"][0]["file"], "app.py")
+        traces = list((self.directory / "logs").glob("example-project-*.jsonl"))
+        self.assertEqual(len(traces), 1)
+
+    def test_trace_option_overrides_the_default_location(self):
+        client = FakeClient(reply(call(FINISH_AUDIT, {"summary": "done"}, "a")))
+        target = self.directory / "custom" / "run.jsonl"
+        with patch.object(agent, "LLMClient", return_value=client):
+            result = agent.main([*self.ARGV, "--trace", str(target)])
+        self.assertEqual(result, 0)
+        self.assertTrue(target.is_file())
+        self.assertFalse((self.directory / "logs").exists())
+
+    def test_disabled_trace_setting_writes_no_logs_directory(self):
+        client = FakeClient(reply(call(FINISH_AUDIT, {"summary": "done"}, "a")))
+        with (
+            patch.dict(os.environ, {"AUDITOR_TRACE_ENABLED": "false"}),
+            patch.object(agent, "LLMClient", return_value=client),
+        ):
+            result = agent.main(self.ARGV)
+        self.assertEqual(result, 0)
+        self.assertFalse((self.directory / "logs").exists())
+
+    def test_verbose_logs_turns_and_tool_names_to_stderr(self):
+        client = FakeClient(reply(call("list_files", {}, "a")), reply(call(FINISH_AUDIT, {}, "b")))
+        with patch.object(agent, "LLMClient", return_value=client):
+            result = agent.main([*self.ARGV, "--verbose"])
+        self.assertEqual(result, 0)
+        self.assertIn("turn 1: list_files", self.stderr.getvalue())
+
+    def test_quiet_run_prints_no_progress(self):
+        client = FakeClient(reply(call(FINISH_AUDIT, {}, "a")))
+        with patch.object(agent, "LLMClient", return_value=client):
+            agent.main(self.ARGV)
+        self.assertNotIn("turn 1", self.stderr.getvalue())
+
+
+class ReportWriterTests(unittest.TestCase):
     def test_report_writer_creates_valid_json(self):
-        report = {"repository": self.repository.address.url, "violations": []}
+        report = {"repository": REPO_URL, "violations": []}
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "reports" / "report.json"
-            agent._write_report(str(output), report)
+            agent.write_report(str(output), report)
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), report)
             self.assertFalse(output.with_name(output.name + ".tmp").exists())
-
-    def test_cli_returns_nonzero_for_repository_failure(self):
-        with (
-            patch.object(
-                agent.RepositoryAddress,
-                "parse",
-                side_effect=agent.RepositoryError("repository unavailable"),
-            ),
-            patch("agent.sys.stderr", new_callable=io.StringIO) as stderr,
-        ):
-            result = agent.main(
-                ["--repo", "https://github.com/example/project", "--output", "report.json"]
-            )
-        self.assertEqual(result, 1)
-        self.assertIn("repository unavailable", stderr.getvalue())
 
 
 if __name__ == "__main__":

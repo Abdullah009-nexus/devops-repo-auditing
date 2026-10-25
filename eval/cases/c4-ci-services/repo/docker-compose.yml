@@ -1,0 +1,9 @@
+# Local development only; not used by CI or deployment.
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: orders
+    ports:
+      - "3306:3306"

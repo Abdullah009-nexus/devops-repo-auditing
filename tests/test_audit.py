@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from audit import audit_inspected_files, supports_finding
+from auditor.checks import audit_inspected_files, supports_finding
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"

@@ -1,0 +1,11 @@
+{
+  "category": "A",
+  "violations": [
+    {
+      "rule_id": "SEC-001",
+      "category": "security",
+      "file": "settings.py",
+      "line": 5
+    }
+  ]
+}

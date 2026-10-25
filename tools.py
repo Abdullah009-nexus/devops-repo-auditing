@@ -2,182 +2,110 @@
 
 from __future__ import annotations
 
-import json
+import fnmatch
 import re
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
-from typing import Any
+from types import TracebackType
+from typing import Any, Callable
 
-
-API_ROOT = "https://api.github.com"
-RAW_ROOT = "https://raw.githubusercontent.com"
-REQUEST_TIMEOUT = 15
-MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-MAX_FILE_BYTES = 256 * 1024
-MAX_LISTED_FILES = 5000
-MAX_SEARCH_FILES = 100
-MAX_SEARCH_MATCHES = 50
-SEARCHABLE_SUFFIXES = {
-    ".cfg", ".conf", ".css", ".dockerfile", ".env", ".example", ".go",
-    ".ini", ".java", ".js", ".json", ".md", ".mk", ".php", ".properties",
-    ".py", ".rb", ".rs", ".sh", ".sql", ".tf", ".toml", ".ts", ".txt",
-    ".xml", ".yaml", ".yml", ".yml",
-}
-SENSITIVE_ASSIGNMENT = re.compile(
-    r"""(?ix)
-    (\b(?:api[_-]?(?:key|token)|client[_-]?secret|secret(?:[_-]?key)?|token|
-        password|passwd|credential|private[_-]?key)\b\s*[:=]\s*)
-    (?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;#]+)
-    """
+from auditor.checks import audit_inspected_files, supports_finding
+from auditor.redaction import redact_secrets, redacted_lines
+from auditor.repository import (
+    RepositoryAddress,
+    RepositoryError,
+    RepositorySource,
+    open_source,
 )
-KNOWN_TOKEN = re.compile(
-    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
-    r"AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b"
-)
-BEARER_TOKEN = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}")
-PRIVATE_KEY_BLOCK = re.compile(
-    r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
-    re.DOTALL,
-)
+from auditor.settings import GitLogSettings, Settings
 
 
-class RepositoryError(Exception):
-    """Raised when a repository cannot be inspected safely."""
-
-
-def redact_secrets(text: str) -> str:
-    """Remove likely credential values before content is returned to the agent."""
-    text = PRIVATE_KEY_BLOCK.sub("[REDACTED PRIVATE KEY]", text)
-    text = SENSITIVE_ASSIGNMENT.sub(r"\1[REDACTED]", text)
-    text = KNOWN_TOKEN.sub("[REDACTED TOKEN]", text)
-    return BEARER_TOKEN.sub(r"\1[REDACTED]", text)
-
-
-def _request_bytes(url: str, *, accept: str, limit: int) -> bytes:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": accept,
-            "User-Agent": "devops-repository-auditing-agent/1.0",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            data = response.read(limit + 1)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise RepositoryError("GitHub resource was not found or is not public.") from exc
-        if exc.code == 403:
-            raise RepositoryError(
-                "GitHub denied the request; check API rate limits and repository access."
-            ) from exc
-        raise RepositoryError(f"GitHub request failed with HTTP {exc.code}.") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise RepositoryError(f"GitHub request failed: {exc.reason if isinstance(exc, urllib.error.URLError) else 'timed out'}.") from exc
-    if len(data) > limit:
-        raise RepositoryError("GitHub response exceeded the configured size limit.")
-    return data
-
-
-def _request_json(url: str, *, limit: int = MAX_RESPONSE_BYTES) -> dict[str, Any]:
-    raw = _request_bytes(
-        url,
-        accept="application/vnd.github+json",
-        limit=limit,
-    )
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise RepositoryError("GitHub returned invalid JSON.") from exc
-    if not isinstance(parsed, dict):
-        raise RepositoryError("GitHub returned an unexpected response.")
-    return parsed
-
-
-@dataclass(frozen=True)
-class RepositoryAddress:
-    owner: str
-    name: str
-    url: str
-
-    @classmethod
-    def parse(cls, value: str) -> "RepositoryAddress":
-        parsed = urllib.parse.urlsplit(value.strip())
-        if (
-            parsed.scheme.lower() != "https"
-            or parsed.hostname != "github.com"
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise RepositoryError(
-                "Repository must be a public HTTPS URL in the form "
-                "https://github.com/owner/repository."
-            )
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) != 2:
-            raise RepositoryError(
-                "Repository URL must identify exactly one GitHub owner and repository."
-            )
-        owner, name = parts
-        if name.endswith(".git"):
-            name = name[:-4]
-        if not owner or not name:
-            raise RepositoryError("Repository owner and name are required.")
-        canonical = f"https://github.com/{owner}/{name}"
-        return cls(owner=owner, name=name, url=canonical)
+# GitHub Actions workflow syntax, not tunables. YAML 1.1 reads a bare `on` as true,
+# so the key is matched as written rather than parsed.
+_TRIGGER_KEY = "on"
+_JOBS_KEY = "jobs"
+_PERMISSIONS_KEY = "permissions"
+_YAML_KEY = re.compile(r"""^(?P<indent> *)["']?(?P<key>[A-Za-z0-9_][\w.-]*)["']?\s*:(?P<value>.*)$""")
+_YAML_LIST_ITEM = re.compile(r"""^ *- +["']?(?P<key>[A-Za-z0-9_][\w-]*)["']?\s*(?:#.*)?$""")
+_YAML_COMMENT = re.compile(r"\s+#.*$")
 
 
 class GitHubRepository:
-    """Minimal read-only GitHub API client with bounded file inspection."""
+    """Bounded, redacted inspection of one repository snapshot.
 
-    def __init__(self, address: RepositoryAddress):
+    Use it as a context manager: closing it deletes the temporary clone.
+    """
+
+    def __init__(
+        self,
+        address: RepositoryAddress,
+        settings: Settings,
+        source: RepositorySource | None = None,
+    ):
         self.address = address
-        repo_path = f"{API_ROOT}/repos/{address.owner}/{address.name}"
-        metadata = _request_json(repo_path)
-        if metadata.get("private") is True:
-            raise RepositoryError("Only public GitHub repositories are supported.")
-        default_branch = metadata.get("default_branch")
-        if not isinstance(default_branch, str) or not default_branch:
-            raise RepositoryError("GitHub repository has no discoverable default branch.")
-        self.branch = default_branch
-        encoded_branch = urllib.parse.quote(self.branch, safe="")
-        tree_url = (
-            f"{repo_path}/git/trees/{encoded_branch}?recursive=1"
-        )
-        tree = _request_json(tree_url)
-        entries = tree.get("tree")
-        if not isinstance(entries, list):
-            raise RepositoryError("GitHub did not return a repository file tree.")
-        self.tree_truncated = tree.get("truncated") is True
-        self.files: dict[str, dict[str, Any]] = {}
-        for entry in entries[:MAX_LISTED_FILES]:
-            if (
-                isinstance(entry, dict)
-                and entry.get("type") == "blob"
-                and isinstance(entry.get("path"), str)
-            ):
-                self.files[entry["path"]] = entry
-        self.list_truncated = self.tree_truncated or len(entries) > MAX_LISTED_FILES
+        self.settings = settings
+        self.source = source if source is not None else open_source(address, settings)
         self._read_cache: dict[str, str] = {}
+        self._redacted_cache: dict[str, list[str]] = {}
         self._inspected_paths: set[str] = set()
+        self._listing_complete = False
 
-    def list_files(self) -> dict[str, Any]:
-        paths = sorted(self.files)
+    def __enter__(self) -> GitHubRepository:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.source.close()
+
+    def list_files(
+        self,
+        path_prefix: str | None = None,
+        glob: str | None = None,
+    ) -> dict[str, Any]:
+        source = self.source
+        prefix = self._validate_prefix(path_prefix) if path_prefix is not None else None
+        if glob is not None:
+            self._check_pattern_length(glob, "Tool argument 'glob'")
+        matching = [
+            path
+            for path in sorted(source.files)
+            if (prefix is None or path.startswith(prefix))
+            and (glob is None or fnmatch.fnmatchcase(path, glob))
+        ]
+        if not source.truncated:
+            self._listing_complete = True
+        limit = self.settings.repository.max_list_entries
+        returned = matching[:limit]
         result: dict[str, Any] = {
             "repository": self.address.url,
-            "default_branch": self.branch,
-            "files": paths,
-            "file_count_returned": len(paths),
-            "truncated": self.list_truncated,
+            "default_branch": source.default_branch,
+            "backend": source.backend,
+            "files": returned,
+            "total_files": len(matching),
+            "returned": len(returned),
+            "truncated": source.truncated or len(matching) > len(returned),
+            "tree_truncated": source.truncated,
         }
-        if self.list_truncated:
+        if prefix is not None:
+            result["path_prefix"] = prefix
+        if glob is not None:
+            result["glob"] = glob
+        if source.fallback_reason is not None:
+            result["fallback_reason"] = source.fallback_reason
+        if source.truncated:
             result["notice"] = (
-                "The GitHub file tree was truncated; absence of a path is not "
+                "The file listing was truncated; absence of a path is not "
                 "evidence that the file does not exist."
+            )
+        elif len(matching) > len(returned):
+            result["notice"] = (
+                f"Only the first {limit} matching paths are listed; narrow the "
+                "listing with path_prefix or glob to see the rest."
             )
         return result
 
@@ -191,145 +119,380 @@ class GitHubRepository:
             raise RepositoryError("File path must be a normalized repository-relative path.")
         return normalized
 
-    def read_file(self, path: str) -> dict[str, Any]:
+    @staticmethod
+    def _validate_prefix(prefix: str) -> str:
+        normalized = prefix.replace("\\", "/")
+        # A trailing slash is how a caller says "this directory only".
+        parts = normalized.removesuffix("/").split("/")
+        if (
+            not normalized
+            or "\x00" in normalized
+            or normalized.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise RepositoryError("path_prefix must be a normalized repository-relative path.")
+        return normalized
+
+    def _check_pattern_length(self, pattern: str, name: str) -> None:
+        if not pattern.strip():
+            raise RepositoryError(f"{name} must be a non-empty string.")
+        limit = self.settings.search.max_pattern_length
+        if len(pattern) > limit:
+            raise RepositoryError(f"{name} must not exceed {limit} characters.")
+
+    def read_file(
+        self,
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> dict[str, Any]:
         normalized = self._validate_path(path)
-        entry = self.files.get(normalized)
-        if entry is None:
-            raise RepositoryError(f"File is not present in the repository tree: {normalized}")
-        size = entry.get("size")
-        if isinstance(size, int) and size > MAX_FILE_BYTES:
+        repository = self.settings.repository
+        ranged = start_line is not None or end_line is not None
+        if ranged:
+            self._check_size(normalized, repository.max_range_file_bytes, ranged=True)
+            self._load(normalized, repository.max_range_file_bytes)
+        else:
+            self._load_whole(normalized)
+        self._inspected_paths.add(normalized)
+        lines = self._redacted(normalized)
+        first = 1 if start_line is None else start_line
+        if first < 1 or (end_line is not None and end_line < first):
+            raise RepositoryError("Line range must satisfy 1 <= start_line <= end_line.")
+        if first > max(len(lines), 1):
             raise RepositoryError(
-                f"File exceeds the {MAX_FILE_BYTES}-byte inspection limit: {normalized}"
+                f"start_line {first} is past the end of {normalized} ({len(lines)} lines)."
             )
-        if normalized not in self._read_cache:
-            encoded_path = urllib.parse.quote(normalized, safe="/")
-            encoded_branch = urllib.parse.quote(self.branch, safe="")
-            url = (
-                f"{RAW_ROOT}/{self.address.owner}/{self.address.name}/"
-                f"{encoded_branch}/{encoded_path}"
+        requested_last = len(lines) if end_line is None else min(end_line, len(lines))
+        last = min(requested_last, first + repository.max_read_lines - 1)
+        rendered = "\n".join(
+            f"{number}: {lines[number - 1]}" for number in range(first, last + 1)
+        )
+        result: dict[str, Any] = {
+            "path": normalized,
+            "line_count": len(lines),
+            "start_line": first,
+            "end_line": last,
+            "content": rendered,
+            "truncated": last < requested_last,
+            "secrets_redacted": True,
+        }
+        if last < requested_last:
+            result["next_start_line"] = last + 1
+        return result
+
+    def _check_size(self, path: str, limit: int, *, ranged: bool) -> None:
+        if path not in self.source.files:
+            raise RepositoryError(f"File is not present in the repository tree: {path}")
+        size = self.source.files[path]
+        if size is None and path in self._read_cache:
+            size = len(self._read_cache[path].encode("utf-8"))
+        if size is None or size <= limit:
+            return
+        if not ranged and size <= self.settings.repository.max_range_file_bytes:
+            raise RepositoryError(
+                f"File exceeds the {limit}-byte whole-file limit: {path}; read it "
+                "with start_line/end_line instead."
             )
-            raw = _request_bytes(
-                url,
-                accept="application/octet-stream",
-                limit=MAX_FILE_BYTES,
-            )
+        raise RepositoryError(f"File exceeds the {limit}-byte inspection limit: {path}")
+
+    def _load_whole(self, path: str) -> str:
+        limit = self.settings.repository.max_file_bytes
+        self._check_size(path, limit, ranged=False)
+        return self._load(path, limit)
+
+    def _load(self, path: str, limit: int) -> str:
+        if path not in self._read_cache:
+            raw = self.source.read_bytes(path, limit)
             try:
                 content = raw.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise RepositoryError(f"File is not UTF-8 text: {normalized}") from exc
-            self._read_cache[normalized] = content
-        self._inspected_paths.add(normalized)
-        lines = self._read_cache[normalized].splitlines()
-        rendered = "\n".join(
-            f"{number}: {redact_secrets(line)}"
-            for number, line in enumerate(lines, start=1)
-        )
-        return {
-            "path": normalized,
-            "line_count": len(lines),
-            "content": rendered,
-            "secrets_redacted": True,
-        }
+                raise RepositoryError(f"File is not UTF-8 text: {path}") from exc
+            self._read_cache[path] = content
+        return self._read_cache[path]
 
-    def search_code(self, pattern: str) -> dict[str, Any]:
-        if not isinstance(pattern, str) or not pattern.strip():
+    def _redacted(self, path: str) -> list[str]:
+        lines = self._redacted_cache.get(path)
+        if lines is None:
+            # Redacted as a whole: a private key spans lines, so per-line redaction misses it.
+            lines = redacted_lines(self._read_cache[path])
+            self._redacted_cache[path] = lines
+        return lines
+
+    def search_code(
+        self,
+        pattern: str,
+        regex: bool = False,
+        path_glob: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(pattern, str):
             raise RepositoryError("Search pattern must be a non-empty string.")
-        if len(pattern) > 200:
-            raise RepositoryError("Search pattern must not exceed 200 characters.")
-        needle = pattern.casefold()
+        self._check_pattern_length(pattern, "Search pattern")
+        if path_glob is not None:
+            self._check_pattern_length(path_glob, "Tool argument 'path_glob'")
+        search = self.settings.search
+        result: dict[str, Any] = {
+            # The pattern may be the model echoing a secret it saw elsewhere.
+            "pattern": redact_secrets(pattern),
+            "mode": "regex" if regex else "literal",
+        }
+        if path_glob is not None:
+            result["path_glob"] = path_glob
+        if regex and re.search(search.alternation_repeat_pattern, pattern):
+            result["error"] = (
+                "Regular expression refused: a repeated group containing alternatives can take "
+                "exponential time. Search for each alternative separately, or drop the repeat."
+            )
+            return result
+        if regex and re.search(search.nested_repeat_pattern, pattern):
+            result["error"] = (
+                "Regular expression refused: a repeated group that repeats inside can take "
+                "exponential time. Rewrite it without nested repetition, e.g. (ab)+ or a+b."
+            )
+            return result
+        try:
+            matches_line = _line_matcher(pattern, regex)
+        except re.error as exc:
+            result["error"] = redact_secrets(f"Invalid regular expression: {exc}.")
+            return result
         candidates = [
             path
-            for path, entry in sorted(self.files.items())
-            if self._is_searchable(path, entry)
+            for path, size in sorted(self.source.files.items())
+            if self._is_searchable(path, size)
+            and (path_glob is None or fnmatch.fnmatchcase(path, path_glob))
         ]
-        scanned: list[str] = []
+        scanned = 0
+        skipped = 0
         matches: list[dict[str, Any]] = []
         unavailable: list[dict[str, str]] = []
-        for path in candidates[:MAX_SEARCH_FILES]:
+        scan_truncated = len(candidates) > search.max_files
+        for path in candidates[:search.max_files]:
             try:
-                self.read_file(path)
+                self._load_whole(path)
             except RepositoryError as exc:
                 unavailable.append({"file": path, "reason": str(exc)})
                 continue
-            scanned.append(path)
-            content = self._read_cache[path]
-            for number, line in enumerate(content.splitlines(), start=1):
-                if needle in line.casefold():
-                    matches.append(
-                        {
-                            "file": path,
-                            "line": number,
-                            "text": redact_secrets(line),
-                        }
-                    )
-                    if len(matches) >= MAX_SEARCH_MATCHES:
-                        return {
-                            "pattern": pattern,
-                            "matches": matches,
-                            "files_scanned": len(scanned),
-                            "unavailable_files": unavailable,
-                            "scan_truncated": True,
-                            "secrets_redacted": True,
-                        }
-        return {
-            "pattern": pattern,
-            "matches": matches,
-            "files_scanned": len(scanned),
-            "unavailable_files": unavailable,
-            "scan_truncated": len(candidates) > len(scanned),
-            "secrets_redacted": True,
-        }
+            self._inspected_paths.add(path)
+            scanned += 1
+            # Matching the redacted text means a search cannot confirm a guess at a
+            # secret value, and each file is redacted once however often it is searched.
+            for number, line in enumerate(self._redacted(path), start=1):
+                if regex and len(line) > search.max_scan_line_chars:
+                    skipped += 1
+                    continue
+                if matches_line(line):
+                    matches.append(self._match(path, number, line))
+                    if len(matches) >= search.max_matches:
+                        break
+            if len(matches) >= search.max_matches:
+                scan_truncated = True
+                break
+        result.update(
+            {
+                "matches": matches,
+                "files_scanned": scanned,
+                "unavailable_files": unavailable,
+                "scan_truncated": scan_truncated,
+                "secrets_redacted": True,
+            }
+        )
+        if regex:
+            result["lines_skipped"] = skipped
+            if skipped:
+                result["notice"] = (
+                    f"{skipped} lines longer than {search.max_scan_line_chars} characters "
+                    "were not searched in regex mode; use a literal search or read_file."
+                )
+        return result
 
-    @staticmethod
-    def _is_searchable(path: str, entry: dict[str, Any]) -> bool:
-        size = entry.get("size")
+    def _match(self, path: str, number: int, line: str) -> dict[str, Any]:
+        limit = self.settings.search.max_line_chars
+        match: dict[str, Any] = {"file": path, "line": number, "text": line[:limit]}
+        if len(line) > limit:
+            match["text_truncated"] = True
+        return match
+
+    def _is_searchable(self, path: str, size: int | None) -> bool:
         suffix = "." + path.rsplit(".", 1)[-1].casefold() if "." in path else ""
         basename = path.rsplit("/", 1)[-1].casefold()
         text_candidate = (
-            suffix in SEARCHABLE_SUFFIXES
-            or basename in {
-                "dockerfile", "makefile", "procfile", "jenkinsfile",
-                ".dockerignore", ".gitignore",
-            }
+            suffix in self.settings.search.searchable_suffixes
+            or basename in self.settings.search.searchable_filenames
         )
         return (
             text_candidate
-            and isinstance(size, int)
-            and size <= MAX_FILE_BYTES
+            and size is not None
+            and size <= self.settings.repository.max_file_bytes
         )
 
-    def git_log(self) -> dict[str, Any]:
-        url = (
-            f"{API_ROOT}/repos/{self.address.owner}/{self.address.name}"
-            "/commits?per_page=10"
-        )
-        raw = _request_bytes(
-            url,
-            accept="application/vnd.github+json",
-            limit=2 * 1024 * 1024,
-        )
-        try:
-            commits = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise RepositoryError("GitHub returned invalid commit history JSON.") from exc
-        if not isinstance(commits, list):
-            raise RepositoryError("GitHub returned an unexpected commit history response.")
-        summaries = []
-        for commit in commits:
-            if not isinstance(commit, dict):
-                continue
-            details = commit.get("commit")
-            if not isinstance(details, dict):
-                continue
-            author = details.get("author")
-            summaries.append(
-                {
-                    "sha": str(commit.get("sha", ""))[:12],
-                    "date": author.get("date") if isinstance(author, dict) else None,
-                    "message": redact_secrets(str(details.get("message", ""))[:1000]),
-                }
+    def git_log(
+        self,
+        max_commits: int | None = None,
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        git_log = self.settings.git_log
+        count = git_log.default_commits if max_commits is None else max_commits
+        count = min(max(count, 1), git_log.max_commits)
+        normalized = self._validate_path(path) if path is not None else None
+        commits = self.source.commits(count, normalized)[:count]
+        summaries = [self._commit_summary(commit) for commit in commits]
+        authors = {commit["author"] for commit in commits if commit.get("author")}
+        result: dict[str, Any] = {
+            "backend": self.source.backend,
+            "max_commits": count,
+            "commits": summaries,
+            "author_count": len(authors),
+        }
+        if normalized is not None:
+            result["path"] = normalized
+        if self.source.backend == "local":
+            result["notice"] = "Commit history is not available for a local directory source."
+        elif commits and all(commit.get("files") is None for commit in commits):
+            result["notice"] = "Changed files per commit are listed only on the clone backend."
+        return result
+
+    def _commit_summary(self, commit: dict[str, Any]) -> dict[str, Any]:
+        git_log = self.settings.git_log
+        # Redact before cutting: a secret split at the limit would otherwise partly survive.
+        message = redact_secrets(commit["message"])
+        summary: dict[str, Any] = {
+            "sha": commit["sha"][: git_log.sha_length],
+            "date": commit["date"],
+            "message": message[: git_log.message_max_chars],
+        }
+        if len(message) > git_log.message_max_chars:
+            summary["message_truncated"] = True
+        files = commit.get("files")
+        if files is not None:
+            limit = git_log.max_files_per_commit
+            summary["files"] = [redact_secrets(name) for name in files[:limit]]
+            if len(files) > limit:
+                summary["files_omitted"] = len(files) - limit
+        return summary
+
+    def get_repo_metadata(self) -> dict[str, Any]:
+        source = self.source
+        metadata = source.metadata
+        result: dict[str, Any] = {
+            "repository": self.address.url,
+            "backend": source.backend,
+            "default_branch": self._metadata_text(source.default_branch),
+            "available": metadata is not None,
+        }
+        if metadata is None:
+            result["notice"] = (
+                "GitHub metadata is not available for this source; only the default "
+                "branch is known."
             )
-        return {"commits": summaries}
+            return result
+        result.update(
+            {
+                "archived": metadata.archived,
+                "fork": metadata.fork,
+                "private": metadata.private,
+                "visibility": self._metadata_text(metadata.visibility),
+                "license_spdx_id": self._metadata_text(metadata.license_spdx_id),
+                "pushed_at": self._metadata_text(metadata.pushed_at),
+                "size_kb": metadata.size_kib,
+            }
+        )
+        return result
+
+    def _metadata_text(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return redact_secrets(value)[: self.settings.github.metadata_max_chars]
+
+    def list_workflows(self) -> dict[str, Any]:
+        workflows = self.settings.workflows
+        directory = workflows.directory.rstrip("/") + "/"
+        paths = [
+            path
+            for path in sorted(self.source.files)
+            if path.startswith(directory)
+            and any(path.casefold().endswith(suffix) for suffix in workflows.suffixes)
+        ]
+        scanned: list[dict[str, Any]] = []
+        unreadable: list[dict[str, str]] = []
+        for path in paths[: workflows.max_files]:
+            try:
+                self._load_whole(path)
+            except RepositoryError as exc:
+                unreadable.append({"file": path, "reason": str(exc)})
+                continue
+            self._inspected_paths.add(path)
+            scanned.append({"file": path, **self._scan_workflow(self._redacted(path))})
+        for path in paths[workflows.max_files:]:
+            unreadable.append(
+                {"file": path, "reason": f"not scanned: over workflows.max_files ({workflows.max_files})"}
+            )
+        result: dict[str, Any] = {
+            "directory": workflows.directory,
+            "workflows": scanned,
+            "unreadable_files": unreadable,
+            "secrets_redacted": True,
+        }
+        if self.source.truncated:
+            result["notice"] = (
+                "The file listing was truncated; workflows outside it are not listed."
+            )
+        return result
+
+    def _scan_workflow(self, lines: list[str]) -> dict[str, Any]:
+        """Line numbers of the trigger block, permissions and job ids, by indentation only."""
+        limit = self.settings.workflows.max_items_per_file
+        text_limit = self.settings.search.max_line_chars
+        trigger_line: int | None = None
+        triggers: list[dict[str, Any]] = []
+        permissions: list[dict[str, Any]] = []
+        jobs: list[dict[str, Any]] = []
+        section: str | None = None
+        child_indent: int | None = None
+        for number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            key_match = _YAML_KEY.match(line)
+            indent = len(line) - len(line.lstrip(" "))
+            if key_match is not None and key_match["key"] == _PERMISSIONS_KEY:
+                permissions.append({"line": number, "text": stripped[:text_limit]})
+            if indent == 0:
+                section, child_indent = None, None
+                if key_match is None:
+                    continue
+                if key_match["key"] == _TRIGGER_KEY:
+                    trigger_line = number
+                    section = _TRIGGER_KEY
+                    triggers.extend(
+                        {"name": name, "line": number}
+                        for name in _inline_triggers(key_match["value"])
+                    )
+                elif key_match["key"] == _JOBS_KEY:
+                    section = _JOBS_KEY
+                continue
+            if section is None:
+                continue
+            if child_indent is None:
+                child_indent = indent
+            if indent != child_indent:
+                continue
+            item = key_match if key_match is not None else _YAML_LIST_ITEM.match(line)
+            if item is None:
+                continue
+            if section == _TRIGGER_KEY:
+                triggers.append({"name": item["key"], "line": number})
+            elif key_match is not None:
+                jobs.append({"id": item["key"], "line": number})
+        result: dict[str, Any] = {
+            "line_count": len(lines),
+            "on_line": trigger_line,
+            "triggers": triggers[:limit],
+            "permissions": permissions[:limit],
+            "jobs": jobs[:limit],
+        }
+        if max(len(triggers), len(permissions), len(jobs)) > limit:
+            result["items_truncated"] = True
+        return result
 
     def validate_finding_location(self, path: str, line: int) -> bool:
         normalized = self._validate_path(path)
@@ -337,6 +500,20 @@ class GitHubRepository:
             return False
         lines = self._read_cache[normalized].splitlines()
         return 1 <= line <= len(lines)
+
+    def listing_complete(self) -> bool:
+        """True once list_files has run on a tree that was not truncated."""
+        return self._listing_complete
+
+    def has_listed_path(self, path: str) -> bool:
+        return self._validate_path(path) in self.source.files
+
+    def redacted_window(self, path: str, first: int, last: int) -> list[str]:
+        """Redacted lines first..last (1-based, inclusive) of a file that was read."""
+        normalized = self._validate_path(path)
+        if normalized not in self._inspected_paths or normalized not in self._read_cache:
+            return []
+        return self._redacted(normalized)[max(first, 1) - 1 : max(last, 0)]
 
     def has_inspected_path(self, path: str) -> bool:
         normalized = self._validate_path(path)
@@ -359,8 +536,6 @@ class GitHubRepository:
         normalized = self._validate_path(path)
         if normalized not in self._inspected_paths:
             return False
-        from audit import supports_finding
-
         return supports_finding(
             rule_id,
             normalized,
@@ -370,63 +545,146 @@ class GitHubRepository:
         )
 
 
-def build_tool_schemas() -> list[dict[str, Any]]:
+def _inline_triggers(value: str) -> list[str]:
+    """Event names from `on: push` or `on: [push, pull_request]`; a flow mapping gives none."""
+    inline = _YAML_COMMENT.sub("", value).strip()
+    if inline.startswith("{"):
+        return []
+    names = (name.strip().strip("'\"") for name in inline.strip("[]").split(","))
+    return [name for name in names if name]
+
+
+def _line_matcher(pattern: str, regex: bool) -> Callable[[str], object]:
+    """Case-insensitive matcher; raises re.error for an invalid regex."""
+    if regex:
+        return re.compile(pattern, re.IGNORECASE).search
+    needle = pattern.casefold()
+    return lambda line: needle in line.casefold()
+
+
+def _object(properties: dict[str, Any], required: tuple[str, ...] = ()) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = list(required)
+    return schema
+
+
+def _function(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {"name": name, "description": description, "parameters": parameters},
+    }
+
+
+def build_tool_schemas(git_log: GitLogSettings) -> list[dict[str, Any]]:
     return [
-        {
-            "type": "function",
-            "function": {
-                "name": "list_files",
-                "description": "List paths in the public repository's default-branch tree.",
-                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a UTF-8 repository file; likely secrets are redacted.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                    "additionalProperties": False,
+        _function(
+            "list_files",
+            "List paths in the repository's default-branch tree, optionally filtered. "
+            "Reports total_files and whether the listing was truncated.",
+            _object(
+                {
+                    "path_prefix": {
+                        "type": "string",
+                        "description": "Only paths starting with this, e.g. '.github/workflows/'.",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "fnmatch pattern on the full path; '*' also matches '/'.",
+                    },
+                }
+            ),
+        ),
+        _function(
+            "read_file",
+            "Read a UTF-8 repository file with numbered lines; likely secrets are redacted. "
+            "Large files are returned in pages; use start_line/end_line (1-based, inclusive).",
+            _object(
+                {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1},
                 },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "search_code",
-                "description": "Search text files for a literal, case-insensitive string.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"pattern": {"type": "string"}},
-                    "required": ["pattern"],
-                    "additionalProperties": False,
+                ("path",),
+            ),
+        ),
+        _function(
+            "search_code",
+            "Search text files, case-insensitively, for a literal string or a Python regex. "
+            "Matching runs on redacted text, so credential values cannot be searched for.",
+            _object(
+                {
+                    "pattern": {"type": "string"},
+                    "regex": {"type": "boolean", "description": "Treat pattern as a regex."},
+                    "path_glob": {
+                        "type": "string",
+                        "description": "fnmatch pattern limiting which paths are searched.",
+                    },
                 },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "git_log",
-                "description": "Read up to ten recent commit summaries from GitHub.",
-                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "audit_inspected_files",
-                "description": (
-                    "Run conservative security and CI checks on files already read. "
-                    "Use after inspecting relevant configuration/source files; results "
-                    "are partial evidence, not a complete repository audit."
-                ),
-                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-            },
-        },
+                ("pattern",),
+            ),
+        ),
+        _function(
+            "git_log",
+            f"Read recent commit summaries (default {git_log.default_commits}, "
+            f"at most {git_log.max_commits}), optionally only those touching a path.",
+            _object(
+                {
+                    "max_commits": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": git_log.max_commits,
+                    },
+                    "path": {"type": "string"},
+                }
+            ),
+        ),
+        _function(
+            "get_repo_metadata",
+            "GitHub metadata for the repository: default branch, archived, fork, "
+            "visibility, license and last push time.",
+            _object({}),
+        ),
+        _function(
+            "list_workflows",
+            "List GitHub Actions workflow files with the line numbers of their "
+            "triggers, permissions entries and job ids.",
+            _object({}),
+        ),
+        _function(
+            "audit_inspected_files",
+            "Run the deterministic detectors on files already read, plus the path "
+            "checks (committed secret files, tracked generated files) on the whole "
+            "file listing. Use after inspecting relevant configuration/source files; "
+            "results are partial evidence, not a complete repository audit.",
+            _object(
+                {
+                    "rule_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Only run the detectors of these rule ids.",
+                    }
+                }
+            ),
+        ),
     ]
+
+
+# Required and optional arguments with their JSON types, per tool.
+_TOOL_ARGUMENTS: dict[str, tuple[dict[str, type], dict[str, type]]] = {
+    "list_files": ({}, {"path_prefix": str, "glob": str}),
+    "read_file": ({"path": str}, {"start_line": int, "end_line": int}),
+    "search_code": ({"pattern": str}, {"regex": bool, "path_glob": str}),
+    "git_log": ({}, {"max_commits": int, "path": str}),
+    "get_repo_metadata": ({}, {}),
+    "list_workflows": ({}, {}),
+    "audit_inspected_files": ({}, {"rule_ids": list}),
+}
+_TYPE_NAMES = {str: "a string", int: "an integer", bool: "a boolean", list: "a list of strings"}
 
 
 class RepositoryTools:
@@ -434,39 +692,60 @@ class RepositoryTools:
         self.repository = repository
 
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if name == "list_files":
-            self._validate_arguments(name, arguments, set())
-            return self.repository.list_files()
-        if name == "read_file":
-            self._validate_arguments(name, arguments, {"path"})
-            path = arguments.get("path")
-            if not isinstance(path, str):
-                raise RepositoryError("Tool argument 'path' must be a string.")
-            return self.repository.read_file(path)
-        if name == "search_code":
-            self._validate_arguments(name, arguments, {"pattern"})
-            pattern = arguments.get("pattern")
-            if not isinstance(pattern, str):
-                raise RepositoryError("Tool argument 'pattern' must be a string.")
-            return self.repository.search_code(pattern)
-        if name == "git_log":
-            self._validate_arguments(name, arguments, set())
-            return self.repository.git_log()
+        spec = _TOOL_ARGUMENTS.get(name)
+        if spec is None:
+            raise RepositoryError(f"Unsupported inspection tool: {name}")
+        values = self._validate_arguments(name, arguments, *spec)
+        repository = self.repository
         if name == "audit_inspected_files":
-            self._validate_arguments(name, arguments, set())
-            from audit import audit_inspected_files
+            rule_ids = values.get("rule_ids")
+            if rule_ids is not None and not all(isinstance(item, str) for item in rule_ids):
+                raise RepositoryError("Tool argument 'rule_ids' must be a list of strings.")
+            result = audit_inspected_files(
+                repository.inspected_files(),
+                paths=repository.source.files,
+                rule_ids=rule_ids,
+            )
+            if repository.source.truncated:
+                result["notice"] = (
+                    "The file listing was truncated; path-based checks did not see every file."
+                )
+            return result
+        handlers: dict[str, Callable[..., dict[str, Any]]] = {
+            "list_files": repository.list_files,
+            "read_file": repository.read_file,
+            "search_code": repository.search_code,
+            "git_log": repository.git_log,
+            "get_repo_metadata": repository.get_repo_metadata,
+            "list_workflows": repository.list_workflows,
+        }
+        return handlers[name](**values)
 
-            return audit_inspected_files(self.repository.inspected_files())
-        raise RepositoryError(f"Unsupported inspection tool: {name}")
+    def _audit(self, rule_ids: list[Any] | None) -> dict[str, Any]:
+        if rule_ids is not None and not all(isinstance(item, str) for item in rule_ids):
+            raise RepositoryError("Tool argument 'rule_ids' must be a list of strings.")
+        source = self.repository.source
+        result = audit_inspected_files(
+            self.repository.inspected_files(), paths=sorted(source.files), rule_ids=rule_ids
+        )
+        if source.truncated:
+            result["tree_truncated"] = True
+            result["tree_notice"] = (
+                "The file listing was truncated; path-based rules cover only the listed paths."
+            )
+        return result
 
     @staticmethod
     def _validate_arguments(
         name: str,
         arguments: dict[str, Any],
-        required: set[str],
-    ) -> None:
-        missing = required - arguments.keys()
-        unexpected = arguments.keys() - required
+        required: dict[str, type],
+        optional: dict[str, type],
+    ) -> dict[str, Any]:
+        # Models often send null for an optional argument they mean to leave out.
+        present = {key: value for key, value in arguments.items() if value is not None}
+        missing = required.keys() - present.keys()
+        unexpected = arguments.keys() - required.keys() - optional.keys()
         if missing:
             raise RepositoryError(
                 f"Tool '{name}' is missing required arguments: {', '.join(sorted(missing))}."
@@ -476,3 +755,12 @@ class RepositoryTools:
                 f"Tool '{name}' received unsupported arguments: "
                 f"{', '.join(sorted(unexpected))}."
             )
+        types = {**required, **optional}
+        for key, value in present.items():
+            expected = types[key]
+            # bool is an int subclass; `start_line: true` is a mistake, not 1.
+            if (expected is int and isinstance(value, bool)) or not isinstance(value, expected):
+                raise RepositoryError(
+                    f"Tool argument '{key}' must be {_TYPE_NAMES[expected]}."
+                )
+        return present

@@ -1,0 +1,1 @@
+Your last message made no tool call. Continue by calling an inspection tool, record a verified violation with report_finding, or call finish_audit if the audit is complete. Findings written in a plain message are not part of the report.

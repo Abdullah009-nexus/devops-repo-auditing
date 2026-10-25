@@ -1,0 +1,11 @@
+name: ci
+on:
+  push:
+    branches: [main]
+permissions: write-all
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m unittest discover -s tests

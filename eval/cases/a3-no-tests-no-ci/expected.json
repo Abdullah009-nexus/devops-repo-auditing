@@ -1,0 +1,17 @@
+{
+  "category": "A",
+  "violations": [
+    {
+      "rule_id": "TST-001",
+      "category": "testing",
+      "file": null,
+      "line": null
+    },
+    {
+      "rule_id": "CI-003",
+      "category": "ci_cd",
+      "file": null,
+      "line": null
+    }
+  ]
+}

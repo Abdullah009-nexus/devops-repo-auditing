@@ -1,0 +1,11 @@
+{
+  "category": "B",
+  "violations": [
+    {
+      "rule_id": "BLD-003",
+      "category": "build_release",
+      "file": "Dockerfile",
+      "line": 1
+    }
+  ]
+}
