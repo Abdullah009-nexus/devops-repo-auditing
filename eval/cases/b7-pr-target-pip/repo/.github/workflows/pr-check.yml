@@ -1,0 +1,17 @@
+name: pr-check
+on:
+  pull_request_target:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.number }}/merge
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install . && python -m pytest

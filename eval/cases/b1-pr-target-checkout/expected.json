@@ -1,0 +1,11 @@
+{
+  "category": "B",
+  "violations": [
+    {
+      "rule_id": "CI-002",
+      "category": "security",
+      "file": ".github/workflows/pr-test.yml",
+      "line": 13
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "category": "B",
+  "violations": [
+    {
+      "rule_id": "CFG-001",
+      "category": "configuration",
+      "file": "config.py",
+      "line": 3
+    }
+  ]
+}

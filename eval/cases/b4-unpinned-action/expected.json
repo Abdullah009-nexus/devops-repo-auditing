@@ -1,0 +1,11 @@
+{
+  "category": "B",
+  "violations": [
+    {
+      "rule_id": "CI-008",
+      "category": "security",
+      "file": ".github/workflows/lint.yml",
+      "line": 12
+    }
+  ]
+}

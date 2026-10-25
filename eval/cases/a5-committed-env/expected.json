@@ -1,0 +1,17 @@
+{
+  "category": "A",
+  "violations": [
+    {
+      "rule_id": "SEC-003",
+      "category": "security",
+      "file": ".env",
+      "line": null
+    },
+    {
+      "rule_id": "SEC-001",
+      "category": "security",
+      "file": ".env",
+      "line": 2
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+# Python artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets; the template stays tracked
+.env
+!.env.example
+
+# Run output (sample_report.json is committed on purpose)
+logs/
+report*.json

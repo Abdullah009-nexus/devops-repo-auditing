@@ -1,0 +1,12 @@
+name: greet
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print title
+        run: echo "New pull request ${{ github.event.pull_request.title }}"
